@@ -57,7 +57,7 @@ ADR-0004 before trusting any layout assumption.
 
 ## ADR-0002 — Linking SurrealDB's crates makes our engine BUSL-encumbered
 
-**Status:** **open — needs an owner decision** · **Date:** 2026-10-01
+**Status:** **accepted — Path A chosen** · **Decided:** 2026-10-01
 
 ### Context
 
@@ -110,30 +110,83 @@ key/value encoding contract from scratch.
 - Benefit: unencumbered, sellable, competing-capable, and the Apache-2.0
   licence is honest end to end.
 
+### Licence history (verified 2026-10-01 via the upstream `LICENSE` file history)
+
+| Date | Commit | Terms |
+| --- | --- | --- |
+| 2016-02-26 → 2016-05-11 | `d74af9681`, `2ad46f5f3` | Apache-2.0 boilerplate, predating SurrealDB's public release |
+| **2021-12-14** | `5c4b9f83d` "Add license for SurrealDB 1.0.0" | **BUSL-1.1 from the first public release.** Change Date `2026-01-01` |
+| 2023-04-01 | `54d285f1e` "Update license change date" | Change Date → `2027-04-01` |
+| 2024-08-22 | `5bf311955` (#4582) | Licensed Work → "SurrealDB 2.0"; Change Date → `2029-09-17`; *Database Service* definition broadened |
+| 2025-12-17 | `a504d2d1b` (#6683) | Licensed Work → "SurrealDB 3.0"; Change Date → `2030-01-01`; *Database Service* broadened again |
+
+Three things this history tells us:
+
+1. **BUSL has applied since day one.** SurrealDB has never been open source, and
+   the Apache-2.0 badge in its `CARGO.md` is not evidence of anything.
+2. **The Change Date is not a reliable planning assumption.** It has moved twice,
+   each time later, and has been extended past the nominal four-year mark. Treat
+   the encumbrance as open-ended.
+3. **The *Database Service* definition has broadened with every major release** —
+   from "creating tables whose schemas are controlled by such third parties"
+   (1.0) to "creating or managing" (2.0) to "any product, service, platform, or
+   commercial offering … to provide database functionality to third parties"
+   (3.0). This is the clause we are most exposed to under Path A, and the trend
+   runs against us.
+
 ### Decision
 
-**Deferred.** The current default for the scaffold is **Path A**, because it is
-the leverage-optimal starting point and it is reversible: Path A's engine logic
-lives in engine-specific modules with no SurrealDB imports at the algorithmic
-layer, so a later move to Path B is a matter of reimplementing the boundary
-types, not the consensus and storage code.
+**Path A. Link SurrealDB's crates and use them wherever it is the right tool.**
 
-But this is an owner's call, not a technical one, and it depends on intent we do
-not know: research artifact, internal infrastructure, or a product?
+The project links the published interface and builds only what SurrealDB does
+not provide — the distributed storage engine. In practice that means:
 
-### Consequences either way
+| Link and use | Write ourselves |
+| --- | --- |
+| `surrealdb-kvs` — the `Transactable` / `TransactionBuilder` contract | Consensus: leaderless quorum, epochs, view change |
+| `surrealdb-kvs-any` — `BackendProvider`, `Backends` registry | Replication: catch-up, anti-entropy, bounded recovery drain |
+| `surrealdb-datastore`, `surrealdb-catalog` — keyspace, schema | Storage: local durable engine, object-storage tier |
+| `surrealdb-cnf` — configuration | Node membership and endpoint resolution |
+| `surrealdb-server` — HTTP/RPC/CLI surface | Telemetry under the `surrealdb.ds.*` scheme |
+| `surrealdb-engine-api` — the engine interface | |
+| The whole query layer: SurrealQL, planner, HNSW/DiskANN, graph, permissions, live queries | |
 
-- `LICENSE` (Apache-2.0) covers **only** code authored here.
-- Every crate that links SurrealDB crates must declare `license = "BUSL-1.1"` in
-  its `Cargo.toml`. We do this today; it is not cosmetic.
-- The two paths must not be blended inside a single crate.
+This is the leverage-optimal choice and it is what the current crate layout
+already assumes. No restructuring needed.
+
+**"Wherever appropriate" is the operative phrase**, and it has a concrete
+meaning: upstream remains the source of truth for the front end and the storage
+contract; we own the distributed storage engine. We do not reimplement anything
+that already exists and works.
+
+### Consequences
+
+- **Every crate here that links SurrealDB code is BUSL-1.1**, declared in its
+  `Cargo.toml`. `LICENSE` (Apache-2.0) covers only code authored in this
+  repository. `NOTICE` states the boundary in full.
+- **Anything we link cannot be relicensed.** If the commercial goal ever changes,
+  or a component needs to be closed-source, the fix is to move it behind a
+  process boundary rather than to unwind the link.
+- **Design for separability from the start.** Keep proprietary product logic out
+  of crates that link SurrealDB. The cheapest structure is: our BUSL-licensed
+  engine as a separate process, product logic talking to it over the network —
+  which is also just how SurrealDB is deployed normally.
+- **The Change Date is not a planning assumption.** It has moved twice, each time
+  later, and past the nominal four-year mark. **Do not plan around 2030-01-01.**
+  Re-read the LICENSE parameters on every upstream major upgrade;
+  `make audit-upstream` is where that check lives.
+- **Path B stays open.** `consensus`, `replicate` and `storage` hold no SurrealDB
+  imports by design, so a later move to a fully independent implementation costs
+  the boundary types, not the protocol. That is insurance, not a plan.
 
 ### Revisit if
 
-The project acquires a commercial goal, or if we decide the upstream
-conformance suite is worth less than a clean licence. Also revisit after
-**2030-01-01**, when BUSL converts to Apache-2.0 and Path A's cost largely
-disappears.
+- The project needs to sell anything as a *database*, or offer customers schema
+  control — the *Database Service* clause, not the licence mechanics, is what
+  blocks that.
+- A component must be closed-source for commercial reasons.
+- Upstream relicenses to Apache-2.0, which would remove the encumbrance and make
+  a full re-evaluation worthwhile.
 
 ---
 
@@ -213,7 +266,7 @@ A source-tree fact is a hypothesis. A published-artifact fact is evidence.
 
 ## ADR-0005 — Use the upstream conformance suite
 
-**Status:** accepted · **Date:** 2026-10-01
+**Status:** accepted · **Decided:** 2026-10-01 · **Implemented:** 2026-10-02
 
 ### Context
 
@@ -223,16 +276,38 @@ backend "first-party or external" runs the same tests.
 
 ### Decision
 
-Vendor that single crate (Apache-2.0 era source, BUSL-1.1 terms) and make our
-engine pass it. Its modules — `builder_surface`, `defaults`, `edges`,
-`lifecycle`, `multi`, `raw`, `savepoint`, `snapshot`, `timestamp`, `versioned`
-— become our acceptance criteria, and passing them becomes our definition of
-"behaves like a real backend".
+Vendor that single crate and make our engine pass it. Its modules —
+`builder_surface`, `defaults`, `edges`, `lifecycle`, `multi`, `raw`,
+`savepoint`, `snapshot`, `timestamp`, `versioned` — become our acceptance
+criteria, and passing them becomes our definition of "behaves like a real
+backend".
+
+The vendored code is **BUSL-1.1** (SurrealDB's licence, like every crate we
+link), not Apache-2.0 — so is anything that links it, including our test target.
+`vendor/surrealdb-kvs-test/VENDOR.md` records the ref and the provenance;
+`NOTICE` records the licensing path.
+
+### Outcome
+
+Vendored at `vendor/surrealdb-kvs-test/`: upstream `surrealdb/kvs-test` at tag
+`v3.3.0` (`238bfeb`), `src/` byte-for-byte, with its `LICENSE` alongside. It cost
+four dependencies — `inventory`, `surrealdb-kvs`, `libtest-mimic`, `tokio` — and
+dragged in nothing else, so the question of whether vendoring it alone was cheap
+is settled: it was. `cargo test -p surrealdb-ds --test kvs` runs it.
+
+The `upstream/` tree stays a reference and never a build input: cargo sees the
+copy under `vendor/`, not the checkout.
+
+See ADR-0006 for how the engine is registered against it, and PROGRESS.md for the
+first run and what it took.
 
 ### Consequences
 
 - Our test target is BUSL-1.1, and is marked as such.
 - Vendoring one crate is a much smaller exception than forking the repo.
+- The suite's *skips* are part of the contract too. What it declines to check for
+  us is a gap we have to close ourselves, and saying so is cheaper than letting a
+  green run imply coverage — see ADR-0006.
 - We should still write our own differential tests on top; the upstream suite
   tests the contract, not parity with SurrealDB specifically.
 
@@ -240,3 +315,77 @@ engine pass it. Its modules — `builder_surface`, `defaults`, `edges`,
 
 Upstream publishes the suite, or if it turns out to encode SurrealDS-specific
 behaviour we should be deriving independently instead.
+
+---
+
+## ADR-0006 — Register the engine as `surrealds` in the conformance suite
+
+**Status:** accepted · **Date:** 2026-10-02
+
+### Context
+
+The suite does not have one contract; it has one contract **per backend name**.
+Each test declares `only = [...]` / `except = [...]` against the name a consumer
+registers, and the names are an open vocabulary, so a test can reference a
+backend that lives in another repository.
+
+That vocabulary already contains **`surrealds`** — the distributed store this
+project reimplements — in nine places, including as the reason two tests exist at
+all: `raw::getu_unsupported` (`only = [surrealds]`) and
+`multi::multiwriter_same_keys_allow` (`only = [tikv, indxdb, surrealds]`).
+
+So the suite's shape forces a choice to be made explicitly: register as
+`surrealds` and answer to what the real distributed store is documented to do, or
+register under our own name and answer to whatever is easiest.
+
+### Decision
+
+Register as **`surrealds`**.
+
+### What that costs, and why it is worth it
+
+Registering as `surrealds` is strictly *harder*, and it changes the transaction
+model rather than just the test count:
+
+| | `surrealds` | any other name |
+| --- | --- | --- |
+| Overlapping blind writes to one key | **all commit, last wins** | first committer wins, the rest refused |
+| Write skew | must be **prevented** | permitted, and asserted to be |
+| `getu` | must be **refused** | must work; four conflict tests run |
+| `register_metrics` | **required**, every declared name collectable | must return `None` |
+| `transactions_local` | must report **local** | must report local |
+
+The first row is the one that matters. First-committer-wins is a *different
+engine* from the one being reimplemented: the suite describes the distributed
+store's model as write-set validation that retries a blind write at a higher
+timestamp, so overlapping blind writes serialise in timestamp order instead of
+aborting. Under any other name we would have rejected same-key writers and called
+it conformance.
+
+It also makes the second row honest. The suite *ignores*
+`write_skew_permitted` for `surrealds` on the grounds that we are serializable —
+which leaves nothing in the conformance run holding us to it. That gap is ours to
+close, and `crates/surrealdb-ds/tests/serializable.rs` closes it: write skew is
+refused, the refusal is retryable, a refused transaction can be re-executed and
+then commit, disjoint writes both commit, a read-only commit never conflicts, and
+a concurrent write inside a *scanned range* counts as a conflict.
+
+### Consequences
+
+- The engine's transaction model is snapshot isolation with **read-set validation
+  at commit**, and blind writes never conflict. Explicitly not first-committer-wins.
+- `getu` stays refused with `UnsupportedLockedReads`, and the four `getu_*`
+  conflict tests stay reported *ignored*. A real, unfilled gap: plain reads get
+  commit-time validation and `SELECT … FOR UPDATE` inherits it, which is stronger
+  than a row lock but is not the same code path.
+- Every green run has to be read next to the list of what the suite ignored. It
+  is written out in PROGRESS.md rather than left to whoever reads the output.
+- The name is a claim. If our behaviour diverges from the real distributed store's,
+  the suite keeps passing under this name — which makes the Phase 2 differential
+  harness more important, not less.
+
+### Revisit if
+
+Upstream renames or drops `surrealds` from the vocabulary, or if we implement
+locked reads — at which point `getu` moves from refused to required and the
+`surrealds` skips become failures we have to satisfy.

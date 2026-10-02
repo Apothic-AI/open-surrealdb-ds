@@ -28,19 +28,25 @@ writing consensus code.
       `Backends::new_transaction_builder` — **verified at runtime**, coexisting
       with `rocksdb:` and `memory`
 - [x] `crates/surrealdb-ds-server` builds and runs
-- [ ] Vendor `surrealdb-kvs-test`, register a `TestBackend`, run the suite
+- [x] Vendor `surrealdb-kvs-test`, register a `TestBackend`, run the suite — done
+      2026-10-02; see ADR-0005 and ADR-0006
 - [ ] Serve HTTP: `/health`, `/ready`, `/version`, then SurrealQL over `/rpc`
 
 ### Exit criterion
 
 ```
 make check    # all crates type-check        -- PASSING
-make test     # upstream conformance suite passes against our engine
+make test     # upstream conformance suite passes against our engine   -- PASSING
 ```
 
-**Status: 6 of 8 tasks done. `make check` is green with zero warnings; the
-conformance suite is the remaining gap.** The seam is proven, so the riskiest
-part of the project is retired.
+**Status: 7 of 8 tasks done. Both exit-criterion commands are green.** The suite
+runs 77 tests against the engine through the public provider seam; 77 pass, and 12
+are reported *ignored* by the suite's own backend-name filters — what those skips
+are is written out in PROGRESS.md rather than left to whoever reads the output.
+The remaining task is the HTTP surface, and its seam is settled:
+`surrealdb_server::init` takes a composer, and `TransactionBuilderFactory` is
+where a caller-built `Backends` registry goes (R-0036). The riskiest part of the
+project is retired.
 
 ---
 
@@ -61,7 +67,14 @@ this is legitimate to implement against — subject to ADR-0002.
 - [ ] Reconstruct the key encoding contract from the published interface
 - [ ] Local durable backend (RocksDB as a dependency of ours, not theirs)
 - [ ] Golden-file tests: dataset written by upstream, read by us, and back
-- [ ] Snapshot and versioned-read support (`kvs-test::snapshot`, `::versioned`)
+- [x] Read-snapshot isolation (`kvs-test::snapshot`) — per-key versions and commit
+      stamps, done 2026-10-02
+- [ ] Versioned (time-travel) reads (`kvs-test::versioned`) — currently *refused*
+      with `UnsupportedVersionedQueries`, which is what the suite requires of every
+      backend registered without versioning, us included
+- [ ] Version GC. Versions accumulate for the life of the process; a durable local
+      engine gives the log to truncate against
+- [ ] Compaction (`kvs-test::builder_surface::compact_supported`) — still declined
 
 ### Exit criterion
 
@@ -88,11 +101,21 @@ data. Three requirements, all black-box testable:
 
 ### Tasks
 
-- [ ] Re-read the `Transactable` contract at v3.3.0 and enumerate every method
+- [x] Re-read the `Transactable` contract at v3.3.0 and enumerate every method
+- [x] Conflict semantics: read-set validation at commit, retryable refusal, and
+      blind writes serialising in stamp order rather than aborting (R-0034) — done
+      2026-10-02
+- [x] Savepoint semantics (`new` / `release_last` / `rollback_to`) — undo logs with
+      nesting and release-merges, done 2026-10-02
+- [x] Cursor streaming: keys, values, batch, multi-get — done 2026-10-02
+- [ ] Locked reads (`getu`). Refused today, and that refusal is *why* the suite
+      reports its four `getu_*` conflict tests as ignored. Plain reads are validated
+      at commit, which is stronger than a row lock, but it is not the same path
 - [ ] Differential harness against an upstream single-node server, free and unlimited
-- [ ] Savepoint semantics (`new` / `release_last` / `rollback_to`)
-- [ ] Cursor streaming: keys, values, batch, multi-get
 - [ ] Fuzz: random op sequences compared against upstream, output diffed
+- [ ] Live queries end to end. `safe_timestamp` is half of it; the router also needs
+      a broker that relays notifications off-node, and
+      `TransactionBuilderFactory::live_query_broker` is the hook (R-0037)
 
 ### Exit criterion
 
@@ -150,8 +173,12 @@ throughout.
 
 - [ ] Object-storage durable tier (S3-compatible, GCS, Azure)
 - [ ] Restore-from-log-delta on cold start
-- [ ] Node registry and `endpoint_resolver` so peers discover each other
-- [ ] Distributed live queries — relay broker rather than local broker
+- [ ] Node registry and peer discovery. `TransactionBuilderFactory::http_endpoint()`
+      is where a node publishes the endpoint it wants recorded on its `Node` catalog
+      row, and `datastore_node_id()` is what makes live-query ownership routable
+      (R-0037)
+- [ ] Distributed live queries — `TransactionBuilderFactory::live_query_broker()`
+      rather than the default local broker (R-0037)
 - [ ] Rolling upgrade with no downtime
 
 ### Exit criterion

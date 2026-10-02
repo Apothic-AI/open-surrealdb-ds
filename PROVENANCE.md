@@ -27,15 +27,16 @@ discovered — not reconstructed later, when it stops being credible.
 | `DOC` | Used extensively. Primary source. |
 | `REL` | Used heavily. The richest public window into SurrealDS internals, because its bug fixes describe real failure modes. |
 | `OBS` | Not started. Required before Phase 2 — this is what makes it clean-room. |
-| `PUBAPI` | Used. `surrealdb-kvs` / `surrealdb-kvs-any` 3.3.0. BUSL-1.1, see ADR-0002. |
-| `SRC` | Read for interface shape during archaeology. **No code copied, translated, or paraphrased into our source.** Findings recorded as observations in DECISIONS.md. |
+| `PUBAPI` | Used. `surrealdb-kvs` / `surrealdb-kvs-any` / `surrealdb-server` / `surrealdb-core` 3.3.0. BUSL-1.1, see ADR-0002. |
+| `SRC` | Read for interface shape during archaeology, and — since ADR-0005 — for the **contract assertions** of the vendored conformance suite. **No code copied, translated, or paraphrased into our source.** Findings recorded as requirements here with a citation. |
 | `BIN` | **Never used.** Declared off-limits. |
 
 **Firewall.** `upstream/surrealdb/` — a pinned checkout used for reading
 interfaces and as a black-box oracle — is kept textually and operationally
 separate from the crates we build. It is **never a build input**. The only
-SurrealDB code in the build graph is the three published crates we deliberately
-link, and that is a recorded decision (ADR-0002), not an accident.
+SurrealDB code in the build graph is the published crates we deliberately link,
+plus one vendored crate (ADR-0005), and that is a recorded decision, not an
+accident.
 
 **One correction worth recording.** Our first architecture pass read the upstream
 default branch and drew twelve conclusions from it. Checking crates.io showed
@@ -45,6 +46,15 @@ extension seam and whether the storage contract was even public. Ten of twelve
 API assumptions in our first implementation were also wrong. Treat every
 branch-derived claim as a hypothesis until a published artifact confirms it
 (ADR-0001, ADR-0004).
+
+**A second correction, smaller but of the same kind.** R-0030 recorded that
+v3.3.0's `TransactionBuilder` has no `extension()` hook. It has one, with a
+default returning `None` — the hook exists and simply was not overridden. The
+mistake was reading "our implementation does not implement it" as "the trait has
+no such method", which a defaulted method makes indistinguishable from the
+outside. R-0031 supersedes it. The generalisation is the ADR-0004 one: a fact
+about an interface is established by reading the interface, not by noticing
+which parts of it you happened to use.
 
 ---
 
@@ -86,7 +96,14 @@ and a date. Add new records as work proceeds; never edit a citation in place.
 | R-0027 | `Transactable` at v3.3.0 has 36 methods, including `getu` (locked read) and `compact` | PUBAPI | `surrealdb-kvs` 3.3.0 `api.rs` | 2026-10-01 | recorded, implemented |
 | R-0028 | Scan cursors return zero-copy batches built from concatenated buffers plus spans, via `KeysBatch::from_parts` / `ValsBatch::from_parts` | PUBAPI | `surrealdb-kvs` 3.3.0 `api.rs` | 2026-10-01 | recorded, implemented |
 | R-0029 | A zero `limit` on a cursor call is a pure no-op: it consumes no rows, does not exhaust the cursor, and the cursor stays valid | PUBAPI | `surrealdb-kvs` 3.3.0 `ScanCursorKeys::next_batch` docs | 2026-10-01 | recorded, implemented |
-| R-0030 | `v3.3.0`'s `TransactionBuilder` has no `extension()` hook; the pre-release tree had one | PUBAPI | `surrealdb-kvs` 3.3.0 `builder.rs` | 2026-10-01 | recorded |
+| R-0030 | ~~`v3.3.0`'s `TransactionBuilder` has no `extension()` hook; the pre-release tree had one~~ — **superseded by R-0031**, this was wrong | PUBAPI | `surrealdb-kvs` 3.3.0 `builder.rs` | 2026-10-01 | **superseded** 2026-10-02 |
+| R-0031 | `TransactionBuilder` at v3.3.0 has two defaulted hooks beyond the five required methods: `wait_until_serve_ready()` (unbounded wait for a backend that must join a cluster before serving) and `extension(TypeId)` returning `None` by default | PUBAPI | `surrealdb-kvs` 3.3.0 `builder.rs` | 2026-10-02 | recorded |
+| R-0032 | `DestroyRangeHandle` is the shared-`TypeId` shape for out-of-transaction range destruction; a backend publishes one only while it can perform the operation, and `None` is the caller's signal to take a transactional fallback | PUBAPI | `surrealdb-kvs` 3.3.0 `destroy.rs` | 2026-10-02 | recorded, relied on |
+| R-0033 | The conformance suite's backend-name vocabulary already contains `surrealds`; registering under that name puts a backend behind the suite's assertions for the distributed store and *ignores* the ones that contradict its documented model | SRC | `vendor/surrealdb-kvs-test/src/{multi,snapshot,builder_surface,raw}.rs`, `kvs_test!` `only`/`except` lists | 2026-10-02 | recorded, adopted |
+| R-0034 | For a backend named `surrealds` the suite requires: overlapping blind writes to one key all commit and the last committer wins (no write-write conflict detection), reads are validated at commit so write skew is prevented, `getu` is refused with `UnsupportedLockedReads`, and `register_metrics` must return a non-empty set whose every name is collectable | SRC | `vendor/surrealdb-kvs-test/src/multi.rs` `multiwriter_same_keys_allow`; `src/snapshot.rs` `write_skew_permitted`; `src/raw.rs` `getu_unsupported`; `src/builder_surface.rs` `metrics_collectable` | 2026-10-02 | recorded, implemented |
+| R-0035 | `put` refuses an existing key; a `None` precondition on `putc`/`delc`/`clrc` asserts the key is **absent**, which is what makes a conditional create atomic on every backend including last-writer-wins ones | SRC | `vendor/surrealdb-kvs-test/src/raw.rs` `put`; `src/defaults.rs` `clrc`; `src/multi.rs` `multiwriter_same_keys_putc` | 2026-10-02 | recorded, implemented |
+| R-0036 | `surrealdb_server::init` takes a single generic composer implementing `TransactionBuilderFactory + RouterFactory + ConfigCheck + ObservabilityProvider`; `TransactionBuilderFactory` is the seam that accepts a caller-built `Backends` registry, and `CommunityComposer` satisfies it by delegating to `Backends::community()` | PUBAPI | `surrealdb-server` 3.3.0 `lib.rs`; `surrealdb-core` 3.3.0 `kvs/ds.rs` | 2026-10-02 | recorded |
+| R-0037 | `TransactionBuilderFactory` carries the clustered-deployment hooks: `datastore_node_id()` for live-query ownership, `live_query_broker()` to relay notifications off-node instead of using the local broker, and `http_endpoint()` so the node records its own endpoint on the `Node` catalog row for peer discovery | PUBAPI | `surrealdb-core` 3.3.0 `kvs/ds.rs` `TransactionBuilderFactory` | 2026-10-02 | recorded |
 
 ---
 

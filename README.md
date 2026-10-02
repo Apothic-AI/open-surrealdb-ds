@@ -9,11 +9,13 @@ This project is **not a SurrealDB fork**. It is an independent implementation,
 written from public documentation and black-box observation, that targets the
 same *observable behaviour*.
 
-> **Status: Phase 0 — the seam works.** We have a compiling engine crate that
-> registers as a SurrealDB storage backend and constructs through its own URL
-> scheme, alongside upstream's own backends. Storage is in-memory and
-> single-node; nothing here is durable, concurrent, or production-ready.
-> See [PROGRESS.md](PROGRESS.md) for exactly what is verified and
+> **Status: Phase 0 — the seam works, and the engine passes upstream's own
+> conformance suite.** A third-party crate registers as a SurrealDB storage
+> backend, constructs through its own URL scheme alongside upstream's own
+> backends, and passes all 77 runnable tests of SurrealDB's shared backend
+> contract suite. Storage is still in-memory and single-node; nothing here is
+> durable or replicated. See [PROGRESS.md](PROGRESS.md) for exactly what is
+> verified — including what the suite declines to check — and
 > [PLAN.md](PLAN.md) for the roadmap.
 
 ---
@@ -95,6 +97,8 @@ open-surrealdb-ds/
 ├── crates/
 │   ├── surrealdb-ds/          the engine: consensus, replication, recovery
 │   └── surrealdb-ds-server/   binary that registers the engine and serves it
+├── vendor/
+│   └── surrealdb-kvs-test/    upstream's backend contract suite, vendored (ADR-0005)
 └── docs/
     ├── architecture.md        upstream v3.3.0 crate map + the extension seam
     ├── research/              research notes (SurrealDB self-hosting, SurrealDS)
@@ -116,9 +120,17 @@ make audit-upstream # re-check published SurrealDB crates and their licences
 Verified at the time of writing:
 
 ```
+$ make test
+test surrealds::lifecycle::closed_after_commit                       ... ok
+test surrealds::multi::multiwriter_same_keys_allow                  ... ok
+test surrealds::raw::put                                            ... ok
+test surrealds::savepoint::rollback_reverts_writes                  ... ok
+...
+test result: ok. 77 passed; 0 failed; 12 ignored
+
 $ make run
 INFO surrealdb::core::kvs::ds: Starting kvs store in ds+mem
-INFO surrealdb_ds::provider: surrealdb-ds: constructing engine scheme="ds+mem" path=""
+INFO surrealdb_ds::provider: constructing engine scheme="ds+mem" path=""
 INFO surrealdb_ds_server: engine ready: surrealds
 ok: constructed backend for ds+mem://
 ```
@@ -126,6 +138,13 @@ ok: constructed backend for ds+mem://
 The same binary also constructs `rocksdb:`, `memory` and `ds://node1` — our
 provider coexists with upstream's rather than replacing it — and rejects an
 unknown scheme with a clean error.
+
+The 12 ignored tests are the suite's own per-backend filters, and they are the
+interesting part of the result: the suite's vocabulary already names `surrealds`,
+so registering under that name puts us behind the assertions reserved for the
+engine we are reimplementing — and behind the skips that come with it. What they
+are, and what we test ourselves because of them, is in
+[PROGRESS.md](PROGRESS.md#what-the-suite-does-not-check-for-us).
 
 ---
 
@@ -142,10 +161,13 @@ This is the part that matters most, and the easiest to get wrong by accident.
    compile against (`surrealdb-kvs`, `surrealdb-kvs-any`) — and where we compile
    against it, we are bound by its licence. See ADR-0002.
 3. **The conformance suite is upstream's, and that is deliberate.**
-   `surrealdb-kvs-test` is a published-but-unlisted shared contract suite for
-   exactly this kind of backend. Passing it is the strongest available evidence
-   that our engine behaves like a real one. It is BUSL-1.1, so our test target
-   is too.
+   `surrealdb-kvs-test` is not on crates.io (`publish = false`), so it is vendored
+   under `vendor/` — upstream's source, unmodified, BUSL-1.1 — and our test target
+   is BUSL-1.1 with it. Passing a contract suite we did not write is the
+   strongest available evidence that the engine behaves like a real one; passing
+   tests we adapted to our engine would be worth nothing. See ADR-0005.
+   Its *skips* are part of the contract too, so what it will not check for us is
+   recorded and covered by our own tests. See ADR-0006.
 4. **Observations are recorded before they are implemented.** No requirement
    enters `docs/spec/` without a provenance entry.
 

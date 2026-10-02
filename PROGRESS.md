@@ -8,6 +8,181 @@ Status legend: `[x]` done and verified · `[~]` in progress · `[ ]` not started
 
 ---
 
+## 2026-10-02 — Phase 0 conformance: the engine passes the upstream suite
+
+**Phase 0's remaining exit criterion is met.** `make test` runs upstream's own
+backend contract suite against our engine, through the public provider seam, and
+it is green.
+
+```
+$ make test
+test result: ok. 10 passed;  0 failed;   0 ignored   (surrealdb-ds unit)
+test result: ok. 77 passed;  0 failed;  12 ignored   (surrealds::… conformance)
+test result: ok.  6 passed;  0 failed;   0 ignored   (surrealdb-ds serializable)
+test result: ok.  1 passed;  0 failed;   0 ignored   (surrealdb-ds doctest)
+test result: ok.  0 passed;  0 failed;   3 ignored   (vendored suite doctests)
+```
+
+77 of 77 runnable tests pass. The 12 ignored are the suite's own `only`/`except`
+filters, not skips we added — see "What the suite does not check for us" below.
+
+### Vendoring
+
+- [x] `surrealdb-kvs-test` is vendored at `vendor/surrealdb-kvs-test/`: upstream's
+      `surrealdb/kvs-test` at tag `v3.3.0` (`238bfeb`), `src/` byte-for-byte,
+      BUSL-1.1 `LICENSE` alongside it. Only `Cargo.toml` is ours, and only because
+      upstream inherits its metadata and lint table from a workspace root that
+      does not exist here.
+- [x] **Open question 2 answered: it is cheap.** It depends only on `inventory`,
+      `surrealdb-kvs`, `libtest-mimic` and `tokio`. Nothing else in the workspace
+      comes with it.
+- [x] Verified the published `surrealdb-kvs` 3.3.0 source is byte-identical to the
+      tree at the tag (`api.rs`, `builder.rs`, `err.rs`, `timestamp.rs` all
+      `diff`-clean), so the suite and the crate we link are the same release.
+- [x] `NOTICE` now states the vendoring as a third licensing path distinct from
+      authored-here code and from linked crates.
+
+### Registering as `surrealds` — the finding that shaped the work
+
+The suite's backend-name vocabulary already contains `surrealds`. Registering
+under that name is what puts us behind the assertions the suite reserves for the
+engine we are reimplementing, and it is the honest name for it.
+
+It is also a **stricter** contract than registering under any other name, and the
+specifics were not obvious:
+
+| Suite assertion | For `surrealds` | Why it matters |
+| --- | --- | --- |
+| `multiwriter_same_keys_allow` | **required** | Overlapping blind writes to one key all commit; the last committer's value wins. No write-write conflict detection. |
+| `multiwriter_same_keys_conflict` | ignored | That is the first-committer-wins model, and it is *not* ours. |
+| `snapshot::write_skew_permitted` | ignored | The suite documents the distributed store as serializable, so permitting the anomaly is not asserted of us. |
+| `raw::getu_unsupported` | **required** | `getu` must be refused with `UnsupportedLockedReads`. |
+| `builder_surface::metrics_collectable` | **required** | `register_metrics` must return a non-empty set whose every name is collectable. |
+| `transactions_local` | **required** | The "local" flag must be `true`; upstream's own comment says the enterprise distributed store reports `true`. |
+
+That combination — blind writes never conflict, reads *are* validated at commit —
+is a coherent model and not first-committer-wins, and it is what we now
+implement. Choosing the easier registration name would have kept
+first-committer-wins and the four `getu` tests, and would have been a claim about
+the engine that is not true.
+
+### The first run: what actually failed
+
+Baseline, before any fix: **56 passed, 21 failed, 12 ignored.** The failures
+clustered into exactly the seven places the Phase 0 code was a sketch:
+
+| Failure cluster | Count | Cause |
+| --- | --- | --- |
+| `cancel` did not roll back | 3 | `set` wrote straight through; `cancel_discards_writes`, `commit_after_cancel_errors`, `savepoint::discarded_by_cancel` |
+| No snapshot isolation | 1 | `snapshot::snapshot` — a reader saw a concurrent writer's value |
+| `put` overwrote instead of refusing | 2 | `raw::put`, `defaults::replace` |
+| Versioned reads silently ignored | 1 | `versioned::unsupported_error` |
+| Conditional ops conflicted at *call* time | 4 | every `multi::` conditional test — both transactions saw the other's un-staged write and got `TransactionConditionNotMet` before either committed |
+| Savepoints did nothing | 7 | `rollback_to_save_point` was a no-op; no `NoSavepoint` underflow |
+| Cursor `Break` skipped rows | 2 | `for_each` advanced by `limit` instead of by rows visited |
+| No metrics | 1 | `metrics_collectable` |
+| `local` flag inverted | 1 | `transactions_local` — we returned the *distributed* flag where the contract wants *local* |
+
+The conditional-op cluster is the instructive one: the pre-existing code failed
+these tests for the *wrong* reason. It reported a conflict when both
+transactions had merely read the same value, which is not a conflict at all —
+neither had committed. The suite then failed later tests because there was no
+commit-time check to reach.
+
+### What changed
+
+- [x] `storage.rs` rewritten as a **versioned** keyspace: per-key version lists
+      with tombstones, a stamp handed out under the same lock that appends, and a
+      commit history for range validation. Validation and application happen under
+      **one** lock, so nothing can be written between the check and the write.
+- [x] `txn.rs` rewritten: staged writes (so `cancel` discards by construction),
+      read-your-writes through the staged write set, a **recorded read set**
+      validated at commit, and undo-log savepoints with nesting and
+      release-merges.
+- [x] Conflict model: a write whose read set moved since the snapshot is refused
+      with `Error::TransactionConflict`, which upstream marks retryable (R-0012).
+      A blind write never conflicts with another blind write; both commit and
+      serialise in stamp order (R-0034).
+- [x] All read paths reject a `version` argument with
+      `UnsupportedVersionedQueries` rather than answering from the wrong version.
+- [x] Seven hand-written overrides deleted in favour of the **trait's own
+      defaults**: `replace`, `clr`, `clrc`, `delr`, `clrr`, `batch_keys`,
+      `batch_keys_vals`. They were doing the same work with weaker
+      closed/read-only checks; the defaults encode the contract correctly, and
+      `delr`/`clrr` in particular are where a hand-rolled version forgets to
+      report `TransactionReadonly` on a read-only transaction. `getm`, `getr` and
+      `count` stay overridden — each takes the store lock once and records the
+      read it performed, which the defaults would do key by key.
+- [x] Cursors fixed: a `limit == 0` call consumes nothing and exhausts nothing; a
+      visitor `Break` consumes exactly the rows it saw and counts them, so the
+      next call resumes after the last one.
+- [x] `register_metrics` publishes six `surrealdb.ds.*` counters, each backed by a
+      counter the storage tier maintains. An undeclared name returns `None`, not
+      `0` — a missing series and a flat one are different facts.
+- [x] The "local" flag is now the local flag.
+
+### What the suite does not check for us
+
+Recorded so a green run is not read as more than it is.
+
+1. **`getu` conflict detection (6 tests ignored).** `raw::getu_unsupported`
+   *requires* our refusal, so we are asserted on — but the four `multi::getu_*`
+   tests that would exercise the guarantee are reported ignored. We have no
+   locked reads at all. `SELECT … FOR UPDATE` inherits read-set validation
+   because plain reads already get it, which is a stronger property than a row
+   lock, but it is not the same code path and nothing tests the difference.
+2. **Serializability (1 test ignored).** The suite ignores
+   `write_skew_permitted` for `surrealds` precisely because it expects us to
+   prevent the anomaly — which leaves nothing in the conformance run holding us to
+   it. `crates/surrealdb-ds/tests/serializable.rs` therefore asserts it directly:
+   write skew is refused, the refusal is retryable, a refused transaction can be
+   re-executed and commit, disjoint writes both commit, a read-only commit never
+   conflicts, and a concurrent write *inside a scanned range* is a conflict.
+3. **`compact` (1 test ignored for us).** We report `CompactionNotSupported`,
+   which is the suite's expectation for backends without a compaction primitive.
+   Correct today, and a Phase 1 obligation to stop reporting.
+4. **First-committer-wins (1 test ignored).** Deliberate: we are not that model.
+5. **Three tests that are not about any external backend at all**
+   (`compact_supported`, `transactions_remote`,
+   `destroy_range_empties_the_range` — all `only = [rocksdb]` or
+   `only = [tikv]`). Nothing to do here; they are counted only so the 12 adds up
+   to 9 + 3.
+
+So: 6 + 1 + 1 + 1 + 3 = 12.
+
+### Open questions carried forward — one answered
+
+1. ~~Can `surrealdb-kvs-test` be vendored on its own?~~ — **answered 2026-10-02:
+   yes, it is cheap.** Four dependencies, none of them workspace-wide.
+2. ~~Does `surrealdb-server` expose a public init path accepting a
+   caller-constructed registry?~~ — **answered 2026-10-02: yes.**
+   `surrealdb_server::init` takes one generic composer implementing
+   `TransactionBuilderFactory + RouterFactory + ConfigCheck +
+   ObservabilityProvider`, and `TransactionBuilderFactory` is the seam: its
+   `CommunityComposer` impl is a three-line delegation to
+   `Backends::community()`, so a composer that builds `Backends::community()`,
+   registers `DsBackend`, and returns `TransactionBuilderParts::without_router_state`
+   is the whole of it. Recorded as R-0036. **Not yet wired up** — see below.
+3. Does v3.3.0 still carry the `safe_timestamp` contract? **Yes, confirmed
+   2026-10-02.** `Transactable::safe_timestamp`'s doc comment names SurrealDS by
+   name: a distributed backend whose commit log is non-linear MUST override it or
+   the live-query router misses notifications (R-0010). Nothing in the suite can
+   check this — the test only asserts the watermark does not exceed a freshly
+   minted stamp, which a single node satisfies trivially.
+4. Exact precondition semantics for `putc`/`delc` with `chk = None`: **settled by
+   the suite** (R-0035). `None` asserts the key is *absent*, not "anything goes",
+   which is what makes a conditional create atomic even on a last-writer-wins
+   backend. Our implementation had it right by accident; it is now right by
+   construction and asserted.
+
+### Next action
+
+Wire the composer (R-0036) and serve HTTP: `/health`, `/ready`, `/version`, then
+SurrealQL over `/rpc`. That is the last Phase 0 task, and answering the open
+question unblocked it — the seam is a single generic parameter.
+
+---
+
 ## 2026-10-01 — Project initialised
 
 ### Research and reconnaissance
@@ -67,11 +242,17 @@ Status legend: `[x]` done and verified · `[~]` in progress · `[ ]` not started
       *independent development is permitted*; but any crate that **links** a
       SurrealDB crate becomes a derivative work under BUSL. That splits the
       project into two viable shapes with very different economics.
-- [!] **Open owner decision (ADR-0002).** Path A (link the crates, get the
-      front end and conformance suite free, accept BUSL on the derived crates)
-      versus Path B (zero SurrealDB dependencies, Apache-2.0 end to end,
-      substantially more work). Scaffold currently defaults to Path A, which
-      is reversible at the module boundary.
+- [x] **DECIDED: Path A** (2026-10-01) — link SurrealDB's crates and use them
+      wherever appropriate; write only the distributed storage engine. See
+      ADR-0002, now *accepted*. The repository layout already assumed this, so no
+      restructuring was needed.
+- [x] Confirmed the scope of what we link vs. what we write. Upstream stays
+      authoritative for the front end and the storage contract; we own
+      consensus, replication, recovery, the storage tier, node membership and
+      `surrealdb.ds.*` telemetry.
+- [x] Recorded the design consequence that matters most under Path A: keep
+      proprietary product logic out of crates that link SurrealDB, and prefer a
+      process boundary between them.
 
 ### Scaffolding
 
@@ -137,9 +318,14 @@ published crate, not the branch.
 
 #### Also learned
 
-- `TransactionBuilder` at v3.3.0 has **no `extension()` hook** — the pre-release
-  tree had one for TiKV-specific operations. Phase 4's bucket/object-store work
-  goes through `BucketStoreProvider` in `surrealdb-core` instead.
+- ~~`TransactionBuilder` at v3.3.0 has **no `extension()` hook**.~~ **Wrong, and
+  corrected on 2026-10-02 (R-0031).** It has one — `extension(TypeId)`, plus
+  `wait_until_serve_ready()` — both defaulted, the default returning `None`. The
+  mistake was reading "our implementation does not override it" as "the trait has
+  no such method", which a defaulted method makes indistinguishable from outside.
+  Phase 4's bucket/object-store work does go through `BucketStoreProvider` in
+  `surrealdb-core`, which is a separate composer-level hook and unrelated to
+  `extension()`.
 - `Backends::new_transaction_builder` does not return `TransactionBuilderParts`;
   it returns the boxed builder directly, so there is no router-state threading at
   the registry layer in v3.3.0.
@@ -151,28 +337,31 @@ single biggest risk in the project and it is now retired.
 
 What is **not** done, and should not be assumed:
 
-- Storage is `BTreeMap`-backed and **in-memory**. No durability, no persistence,
-  no concurrency control.
-- Writes are **not** staged. `set` writes straight through and `cancel` rolls
-  nothing back. That is not the contract.
+- Storage is `BTreeMap`-backed and **in-memory**. No durability, no persistence.
+- Transactions are snapshot-isolated with read-set validation, but the whole
+  cluster is **one process and one `Mutex`**. Nothing here survives a crash, and
+  there is no replication.
 - `getu` (locked read) returns `UnsupportedLockedReads`, so `SELECT … FOR UPDATE`
-  has no conflict guarantee yet.
+  has no conflict guarantee of its own.
 - `safe_timestamp` is the single-node default. **Unsafe on more than one node.**
-- `rollback_to_save_point` is a no-op.
 - `compact` declines rather than lying about having done work.
 - The upstream conformance suite has **not** been run — it needs the vendored
-  tree (open question 2).
+  tree. **Done 2026-10-02; see the entry above.**
 - The HTTP surface is not wired up; the binary constructs an engine and exits.
 
-Next action: vendor `surrealdb-kvs-test` and get our engine through the
-conformance suite. That is the real Phase 0 exit criterion in PLAN.md.
+Next action (as of 2026-10-01): vendor `surrealdb-kvs-test` and get our engine
+through the conformance suite. That is the real Phase 0 exit criterion in
+PLAN.md. **Done 2026-10-02.**
 
 ---
 
 ## Open questions carried forward
 
-1. **ADR-0002 licensing decision — Path A or Path B. Owner call, and now the
-   only thing between the project and a clean bill of health.**
+*Superseded by the 2026-10-02 entry above, which answers questions 2–5. Kept as
+written at the time so the record shows what was open when.*
+
+1. ~~ADR-0002 licensing decision~~ — **resolved 2026-10-01: Path A.** No longer
+   blocking.
 2. Can `surrealdb-kvs-test` be vendored on its own, or does it drag in most of
    the workspace? (It depends only on `inventory`, `surrealdb-kvs`,
    `libtest-mimic` and `tokio` — likely cheap, but unverified.)
