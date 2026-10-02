@@ -72,8 +72,10 @@ this is legitimate to implement against — subject to ADR-0002.
 - [ ] Versioned (time-travel) reads (`kvs-test::versioned`) — currently *refused*
       with `UnsupportedVersionedQueries`, which is what the suite requires of every
       backend registered without versioning, us included
-- [ ] Version GC. Versions accumulate for the life of the process; a durable local
-      engine gives the log to truncate against
+- [x] Version GC — live-snapshot pins, horizon-based collection, `history`
+      retired; done 2026-10-02. **Known limit carried forward:** a transaction that
+      is never dropped pins the horizon for ever, so a leaked `Box<dyn Transactable>`
+      stops collection. A query timeout is the fix and does not exist yet.
 - [ ] Compaction (`kvs-test::builder_surface::compact_supported`) — still declined
 
 ### Exit criterion

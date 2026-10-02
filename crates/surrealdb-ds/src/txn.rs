@@ -66,7 +66,28 @@ use surrealdb_kvs::api::{
 use surrealdb_kvs::timestamp::{BoxTimeStamp, HlcTimeStamp};
 use surrealdb_kvs::{Direction, Error, Key, KeyRange, Result, Val};
 
-use crate::storage::{ReadSet, VersionedStore, WriteSet};
+use crate::storage::{ReadSet, SnapshotPin, StorageError, VersionedStore, WriteSet};
+
+/// The storage tier's failure, in the terms the upstream contract has.
+///
+/// This is the one place the two vocabularies meet. `storage.rs` holds no
+/// SurrealDB imports (ADR-0002), so it reports what happened in its own terms and
+/// the mapping is made here.
+impl From<StorageError> for Error {
+	fn from(error: StorageError) -> Self {
+		match error {
+			// Retryable, and distinguishable from a definite failure, so an SDK
+			// retry helper knows to start the transaction again (R-0012).
+			StorageError::Conflict(conflict) => Error::TransactionConflict(format!(
+				"{} key(s) changed since the transaction's snapshot",
+				conflict.keys.len()
+			)),
+			// Not retryable: the tier will not serve this store again at all, so
+			// retrying only produces the same failure.
+			StorageError::Poisoned => Error::internal(StorageError::Poisoned),
+		}
+	}
+}
 
 /// A transaction over the engine's storage tier.
 pub struct DsTxn {
@@ -75,6 +96,21 @@ pub struct DsTxn {
 	/// The stamp this transaction reads at. Every read is resolved against it, so
 	/// the view cannot move under a live transaction.
 	snapshot: u64,
+	/// The hold that keeps `snapshot` reachable while this transaction lives, so
+	/// collection cannot take a version this transaction has yet to read.
+	///
+	/// Taken once, for the whole life of the transaction, and given up when the
+	/// transaction is closed. It is `Option` only so `commit` and `cancel` can
+	/// hand it over early — a caller that keeps a finished transaction's handle
+	/// alive should not also keep collection pinned behind it.
+	pin: Mutex<Option<SnapshotPin>>,
+	/// Set when the store was already poisoned as this transaction began.
+	///
+	/// The transaction is then inert: every operation fails, because answering
+	/// from a keyspace the store has declared unusable is exactly the thing it
+	/// refuses to do. `begin` cannot return an error — its caller is upstream's
+	/// transaction factory — so the failure travels with the transaction instead.
+	poisoned: bool,
 	/// Writes staged for commit. `None` is a delete. Empty for a read-only
 	/// transaction, which never stages anything.
 	writes: Mutex<WriteSet>,
@@ -103,14 +139,19 @@ struct UndoScope {
 
 impl DsTxn {
 	pub(crate) fn begin(store: Arc<VersionedStore>, tx_type: surrealdb_kvs::TransactionType) -> Self {
-		let snapshot = store.snapshot();
+		// One pin for the whole transaction, so every read below is answered from a
+		// stamp collection has been told not to move past. Dropping the transaction
+		// — including dropping it without committing or cancelling — releases it.
+		let pin = store.acquire();
 		Self {
 			store,
 			tx_type: match tx_type {
 				surrealdb_kvs::TransactionType::Read => TransactionKind::Read,
 				surrealdb_kvs::TransactionType::Write => TransactionKind::Write,
 			},
-			snapshot,
+			snapshot: pin.as_ref().map_or(0, SnapshotPin::stamp),
+			poisoned: pin.is_err(),
+			pin: Mutex::new(pin.ok()),
 			writes: Mutex::new(WriteSet::new()),
 			reads: Mutex::new(ReadSet::new()),
 			savepoints: Mutex::new(Vec::new()),
@@ -127,11 +168,26 @@ impl DsTxn {
 	}
 
 	fn require_open(&self) -> Result<()> {
+		if self.poisoned {
+			// Never gets as far as the closed check: a transaction born on a
+			// poisoned store is unusable whether or not it has been finished.
+			return Err(StorageError::Poisoned.into());
+		}
 		if self.open() {
 			Ok(())
 		} else {
 			Err(Error::TransactionFinished)
 		}
+	}
+
+	/// Give up the snapshot hold, so collection can move past this transaction.
+	///
+	/// Only ever called once the transaction is closed. Handing the pin over
+	/// earlier would let another thread's collection remove a version this
+	/// transaction is still able to read.
+	fn release_pin(&self) {
+		let pin = Self::lock(&self.pin).take();
+		drop(pin);
 	}
 
 	/// Reject a read that names a version: this engine keeps history for snapshot
@@ -162,10 +218,10 @@ impl DsTxn {
 	///
 	/// Returning owned bytes keeps the store lock from having to outlive the
 	/// answer; at Phase 0 volumes that is the right trade.
-	fn effective(&self, key: &[u8], writes: &WriteSet) -> Option<Vec<u8>> {
+	fn effective(&self, key: &[u8], writes: &WriteSet) -> Result<Option<Vec<u8>>> {
 		match writes.get(key) {
-			Some(val) => val.clone(),
-			None => self.store.get(key, self.snapshot),
+			Some(val) => Ok(val.clone()),
+			None => self.store.get(key, self.snapshot).map_err(Into::into),
 		}
 	}
 
@@ -185,8 +241,8 @@ impl DsTxn {
 	/// The innermost scope owns the pre-image and the enclosing ones must not
 	/// overwrite it with a later one: rolling back to an enclosing scope has to
 	/// restore the value as of *that* scope, not as of a nested one.
-	fn stage_write(&self, key: Vec<u8>, val: Option<Vec<u8>>) {
-		let before = self.effective(&key, &Self::lock(&self.writes));
+	fn stage_write(&self, key: Vec<u8>, val: Option<Vec<u8>>) -> Result<()> {
+		let before = self.effective(&key, &Self::lock(&self.writes))?;
 		// The two locks are never held together, in either order: a rollback
 		// reads the write set while holding the savepoint stack, so taking them
 		// in one order here and the other there would be a deadlock.
@@ -196,6 +252,7 @@ impl DsTxn {
 		}
 		drop(scopes);
 		Self::lock(&self.writes).insert(key, val);
+		Ok(())
 	}
 
 	/// `keys` / `keysr`: recorded keys in `rng`, honouring `limit` and `skip`.
@@ -205,14 +262,14 @@ impl DsTxn {
 		limit: u32,
 		skip: u32,
 		reverse: bool,
-	) -> Vec<Vec<u8>> {
+	) -> Result<Vec<Vec<u8>>> {
 		self.record_range(rng.start.as_slice(), rng.end.as_slice());
 		let writes = Self::lock(&self.writes);
-		let mut pairs = self.scan_pairs(rng, &writes);
+		let mut pairs = self.scan_pairs(rng, &writes)?;
 		if reverse {
 			pairs.reverse();
 		}
-		pairs.into_iter().skip(skip as usize).take(limit as usize).map(|(k, _)| k).collect()
+		Ok(pairs.into_iter().skip(skip as usize).take(limit as usize).map(|(k, _)| k).collect())
 	}
 
 	/// `scan` / `scanr` / `getr`: recorded pairs in `rng`, honouring `limit` and
@@ -223,23 +280,23 @@ impl DsTxn {
 		limit: u32,
 		skip: u32,
 		reverse: bool,
-	) -> Vec<(Vec<u8>, Val)> {
+	) -> Result<Vec<(Vec<u8>, Val)>> {
 		self.record_range(rng.start.as_slice(), rng.end.as_slice());
 		let writes = Self::lock(&self.writes);
-		let mut pairs = self.scan_pairs(rng, &writes);
+		let mut pairs = self.scan_pairs(rng, &writes)?;
 		if reverse {
 			pairs.reverse();
 		}
-		pairs.into_iter().skip(skip as usize).take(limit as usize).collect()
+		Ok(pairs.into_iter().skip(skip as usize).take(limit as usize).collect())
 	}
 
 	/// The transaction's view of `[start, end)`: the snapshot's pairs with the
 	/// staged writes for that span merged over them.
-	fn scan_pairs(&self, rng: &KeyRange<'_>, writes: &WriteSet) -> Vec<(Vec<u8>, Val)> {
+	fn scan_pairs(&self, rng: &KeyRange<'_>, writes: &WriteSet) -> Result<Vec<(Vec<u8>, Val)>> {
 		let start = rng.start.as_slice();
 		let end = rng.end.as_slice();
 		let mut merged: BTreeMap<Vec<u8>, Val> =
-			self.store.range(start, end, self.snapshot).into_iter().collect();
+			self.store.range(start, end, self.snapshot)?.into_iter().collect();
 		for (key, val) in writes.range(start.to_vec()..).take_while(|(k, _)| k.as_slice() < end) {
 			match val {
 				Some(val) => {
@@ -250,7 +307,7 @@ impl DsTxn {
 				}
 			}
 		}
-		merged.into_iter().collect()
+		Ok(merged.into_iter().collect())
 	}
 
 	/// Open a savepoint scope.
@@ -312,7 +369,7 @@ impl DsTxn {
 	fn check(&self, key: &[u8], expected: Option<&[u8]>) -> Result<()> {
 		self.record_point(key);
 		let writes = Self::lock(&self.writes);
-		match (self.effective(key, &writes).as_deref(), expected) {
+		match (self.effective(key, &writes)?.as_deref(), expected) {
 			(None, None) => Ok(()),
 			(Some(actual), Some(expected)) if actual == expected => Ok(()),
 			_ => Err(Error::TransactionConditionNotMet),
@@ -326,7 +383,9 @@ impl Transactable for DsTxn {
 	}
 
 	fn closed(&self) -> bool {
-		!self.open()
+		// A transaction born on a poisoned store is never usable, and reporting it
+		// as open would leave a caller polling for a close that cannot come.
+		self.poisoned || !self.open()
 	}
 
 	fn writeable(&self) -> bool {
@@ -345,6 +404,7 @@ impl Transactable for DsTxn {
 			Self::lock(&self.savepoints).clear();
 			Self::lock(&self.writes).clear();
 			self.closed.store(true, Ordering::Release);
+			self.release_pin();
 			Ok(())
 		})
 	}
@@ -357,6 +417,9 @@ impl Transactable for DsTxn {
 	/// from the beginning. Blind writes to a key another transaction is also
 	/// writing are not a conflict — they serialise in stamp order.
 	///
+	/// A refused commit leaves the transaction open, and its snapshot hold with
+	/// it: a transaction that may retry is still a transaction that can read.
+	///
 	/// A read-only transaction has nothing to commit, so committing one succeeds
 	/// and closes it; it validates nothing, because there is no write that could
 	/// follow from its reads.
@@ -366,15 +429,13 @@ impl Transactable for DsTxn {
 			let writes = Self::lock(&self.writes);
 			if self.tx_type == TransactionKind::Write {
 				let reads = Self::lock(&self.reads);
-				if let Err(conflict) = self.store.commit(self.snapshot, &writes, &reads) {
-					return Err(Error::TransactionConflict(format!(
-						"{} key(s) changed since the transaction's snapshot",
-						conflict.keys.len()
-					)));
+				if let Err(error) = self.store.commit(self.snapshot, &writes, &reads) {
+					return Err(Error::from(error));
 				}
 			}
 			drop(writes);
 			self.closed.store(true, Ordering::Release);
+			self.release_pin();
 			Ok(())
 		})
 	}
@@ -387,7 +448,7 @@ impl Transactable for DsTxn {
 			Self::reject_version(version)?;
 			self.record_point(key.as_slice());
 			let writes = Self::lock(&self.writes);
-			Ok(self.effective(key.as_slice(), &writes).is_some())
+			Ok(self.effective(key.as_slice(), &writes)?.is_some())
 		})
 	}
 
@@ -397,7 +458,7 @@ impl Transactable for DsTxn {
 			Self::reject_version(version)?;
 			self.record_point(key.as_slice());
 			let writes = Self::lock(&self.writes);
-			Ok(self.effective(key.as_slice(), &writes))
+			self.effective(key.as_slice(), &writes)
 		})
 	}
 
@@ -420,7 +481,7 @@ impl Transactable for DsTxn {
 			let writes = Self::lock(&self.writes);
 			for key in keys {
 				self.record_point(key.as_slice());
-				match self.effective(key.as_slice(), &writes) {
+				match self.effective(key.as_slice(), &writes)? {
 					Some(val) => {
 						records += 1;
 						value_bytes += val.len() as u64;
@@ -439,8 +500,7 @@ impl Transactable for DsTxn {
 	fn set<'a>(&'a self, key: Key<'a>, val: Val) -> BoxFut<'a, Result<()>> {
 		Box::pin(async move {
 			self.require_writable()?;
-			self.stage_write(key.into_vec(), Some(val));
-			Ok(())
+			self.stage_write(key.into_vec(), Some(val))
 		})
 	}
 
@@ -449,8 +509,7 @@ impl Transactable for DsTxn {
 		Box::pin(async move {
 			self.require_writable()?;
 			self.check(key.as_slice(), None)?;
-			self.stage_write(key.into_vec(), Some(val));
-			Ok(())
+			self.stage_write(key.into_vec(), Some(val))
 		})
 	}
 
@@ -459,8 +518,7 @@ impl Transactable for DsTxn {
 		Box::pin(async move {
 			self.require_writable()?;
 			self.check(key.as_slice(), chk.as_deref())?;
-			self.stage_write(key.into_vec(), Some(val));
-			Ok(())
+			self.stage_write(key.into_vec(), Some(val))
 		})
 	}
 
@@ -469,8 +527,7 @@ impl Transactable for DsTxn {
 	fn del<'a>(&'a self, key: Key<'a>) -> BoxFut<'a, Result<()>> {
 		Box::pin(async move {
 			self.require_writable()?;
-			self.stage_write(key.into_vec(), None);
-			Ok(())
+			self.stage_write(key.into_vec(), None)
 		})
 	}
 
@@ -479,8 +536,7 @@ impl Transactable for DsTxn {
 		Box::pin(async move {
 			self.require_writable()?;
 			self.check(key.as_slice(), chk)?;
-			self.stage_write(key.into_vec(), None);
-			Ok(())
+			self.stage_write(key.into_vec(), None)
 		})
 	}
 
@@ -496,7 +552,7 @@ impl Transactable for DsTxn {
 		Box::pin(async move {
 			self.require_open()?;
 			Self::reject_version(version)?;
-			let keys = self.collect_keys(&rng, limit, skip, false);
+			let keys = self.collect_keys(&rng, limit, skip, false)?;
 			Ok(KeysResult { key_bytes: keys.iter().map(|k| k.len() as u64).sum(), keys })
 		})
 	}
@@ -511,7 +567,7 @@ impl Transactable for DsTxn {
 		Box::pin(async move {
 			self.require_open()?;
 			Self::reject_version(version)?;
-			let keys = self.collect_keys(&rng, limit, skip, true);
+			let keys = self.collect_keys(&rng, limit, skip, true)?;
 			Ok(KeysResult { key_bytes: keys.iter().map(|k| k.len() as u64).sum(), keys })
 		})
 	}
@@ -526,7 +582,7 @@ impl Transactable for DsTxn {
 		Box::pin(async move {
 			self.require_open()?;
 			Self::reject_version(version)?;
-			Ok(scan_result(&self.collect_pairs(&rng, limit, skip, false)))
+			Ok(scan_result(&self.collect_pairs(&rng, limit, skip, false)?))
 		})
 	}
 
@@ -540,7 +596,7 @@ impl Transactable for DsTxn {
 		Box::pin(async move {
 			self.require_open()?;
 			Self::reject_version(version)?;
-			Ok(scan_result(&self.collect_pairs(&rng, limit, skip, true)))
+			Ok(scan_result(&self.collect_pairs(&rng, limit, skip, true)?))
 		})
 	}
 
@@ -548,7 +604,7 @@ impl Transactable for DsTxn {
 		Box::pin(async move {
 			self.require_open()?;
 			Self::reject_version(version)?;
-			Ok(scan_result(&self.collect_pairs(&rng, u32::MAX, 0, false)))
+			Ok(scan_result(&self.collect_pairs(&rng, u32::MAX, 0, false)?))
 		})
 	}
 
@@ -558,7 +614,7 @@ impl Transactable for DsTxn {
 			Self::reject_version(version)?;
 			self.record_range(rng.start.as_slice(), rng.end.as_slice());
 			let writes = Self::lock(&self.writes);
-			Ok(self.scan_pairs(&rng, &writes).len())
+			Ok(self.scan_pairs(&rng, &writes)?.len())
 		})
 	}
 
@@ -610,7 +666,7 @@ impl Transactable for DsTxn {
 		Box::pin(async move {
 			self.require_open()?;
 			Self::reject_version(version)?;
-			let keys = self.collect_keys(&rng, u32::MAX, skip, dir == Direction::Backward);
+			let keys = self.collect_keys(&rng, u32::MAX, skip, dir == Direction::Backward)?;
 			Ok(Box::new(KeysCursor { keys, pos: 0, buf: Vec::new(), spans: Vec::new() })
 				as Box<dyn ScanCursorKeys + 'a>)
 		})
@@ -628,7 +684,7 @@ impl Transactable for DsTxn {
 		Box::pin(async move {
 			self.require_open()?;
 			Self::reject_version(version)?;
-			let pairs = self.collect_pairs(&rng, u32::MAX, skip, dir == Direction::Backward);
+			let pairs = self.collect_pairs(&rng, u32::MAX, skip, dir == Direction::Backward)?;
 			Ok(Box::new(ValsCursor {
 				pairs,
 				pos: 0,
@@ -669,12 +725,17 @@ impl Transactable for DsTxn {
 		Box::pin(async move { self.timestamp().await })
 	}
 
-	/// Compaction hint, declined.
+	/// Compaction request, declined.
 	///
-	/// The in-memory tier reclaims nothing, so there is no honest answer but
-	/// "not supported". Phase 1 gives this a local engine that compacts; a
-	/// success reported over a no-op would tell an operator space was reclaimed
-	/// that was not.
+	/// Not because the tier reclaims nothing — it collects unreachable versions
+	/// as it commits and as pins are released, which is reclamation this engine
+	/// chose rather than was asked for. There is simply no operation to accept: no
+	/// request can make collection happen sooner than the commit path already
+	/// makes it happen, and an in-memory heap has nothing to compact. Answering
+	/// `Ok` would claim work the caller asked for and did not get; the upstream
+	/// suite holds us to refusing.
+	///
+	/// Phase 1 gives this a local engine that compacts.
 	fn compact<'a>(&'a self, _range: Option<KeyRange<'a>>) -> BoxFut<'a, Result<()>> {
 		Box::pin(async move { Err(Error::CompactionNotSupported) })
 	}

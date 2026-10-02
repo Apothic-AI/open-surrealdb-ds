@@ -202,11 +202,82 @@ So: 6 + 1 + 1 + 1 + 3 = 12.
       version change" fallback was written `diff ... || echo`, and `diff` exits 1
       *when the files differ*, so the message printed exactly when it was false.
 
+---
+
+## 2026-10-02 (later) — Version GC, and a poisoned store that tells the truth
+
+Two defects closed. `make check`, `make conformance` (77 passed / 12 ignored),
+clippy at `--deny warnings`, and 19 storage/builder unit tests are green.
+
+### Version GC — the unbounded-growth defect
+
+`storage.rs` grew for the life of the process: every committed version of every
+key forever, plus a `history` deque of every committed `(stamp, key)` pair that
+existed only so range validation could avoid walking the range.
+
+- [x] A transaction **pins** its snapshot stamp for its whole life. The pin lives
+      in `DsTxn` as `Mutex<Option<SnapshotPin>>`, so dropping a transaction
+      without committing or cancelling releases it — the case a commit/cancel-only
+      scheme leaks.
+- [x] Collection retains, per key, **the newest version at or below the oldest
+      pinned stamp, plus everything above it**. That is sufficient, and the
+      argument is in the file: for any live snapshot at or above the horizon,
+      every version at or below it is shadowed by the retained one. With nothing
+      pinned the horizon is the clock, which collapses each key to one version.
+- [x] `history` **deleted**, not bounded. Range validation now checks each key's
+      newest stamp, which costs one pass over the range instead of the number of
+      commits since the snapshot. The file's `# Known limits` section says so
+      plainly rather than pretending the trade is free.
+- [x] Nine new tests. The load-bearing one is
+      `a_pinned_snapshot_still_reads_after_collection`: pin after `v2`, write
+      `v3` and `v4`, collect, then assert `v1` is gone, `v2` survives, the pinned
+      reader still reads `v2`, and a fresh reader reads `v4`.
+      `pinned_reads_match_the_full_history_under_concurrency` checks the same
+      property against full history while writers run.
+
+### The hole, named rather than papered over
+
+A leaked transaction — `mem::forget`, or a retained `Box<dyn Transactable>` —
+holds the horizon for ever and **stops collection entirely**, which is the
+behaviour GC replaced. A leaked `Box` is not hypothetical: `TestDs::transaction`
+returns one, and upstream's own comment says dropping a cursor matters because
+some backends block on it. The fix is a query timeout plus an engine that lets
+the query layer drop its handle; **neither exists yet**, and the file says so.
+
+Collection is also an O(keyspace) walk under the store lock on each horizon
+advance. Documented as a limit; a real engine collects from its local store's
+compaction, off the request path.
+
+### A poisoned store now says so
+
+The old `lock()` recovered from poisoning on the strength of a comment claiming
+the clock and the map "are only ever updated together". **That was false**: the
+clock advances *after* the write loop, so a panic inside it leaves some keys
+carrying a version at a stamp the clock never reached, and the next commit
+computes the same stamp and pushes a second version for those keys. Not a
+"poisoned warning" — a lost-write shape.
+
+Found while reviewing a delegated attempt, not by a test.
+
+The fix is to stop claiming what we cannot guarantee. A poisoned store now marks
+itself and **serves nothing, ever**: `StorageError::Poisoned`, surfaced as
+`Error::Internal`. `DsTxn` remembers if it was born on a poisoned store and
+refuses every operation. Silently serving reads from a keyspace whose versions
+and clock can disagree is the same class of lie as `compact` claiming work it
+did not do.
+
+An intermediate version of this had a dead `Err` match arm that made the poison
+unreachable, so the flag was never set and the crate did not compile under
+`--deny warnings`. Caught by clippy, not by a test.
+
 ### Next action
 
 Wire the composer (R-0036) and serve HTTP: `/health`, `/ready`, `/version`, then
-SurrealQL over `/rpc`. That is the last Phase 0 task, and answering the open
-question unblocked it — the seam is a single generic parameter.
+SurrealQL over `/rpc`. Design and verified interface facts are in the working
+notes; the non-obvious part is that `surrealdb_server::init` boots the **upstream
+CLI**, so our binary inherits the `surreal` command surface, and the community
+router — including `/health`, `/ready`, `/version`, `/rpc` — is one public call
+away.
 
 ---
 
