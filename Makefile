@@ -6,7 +6,7 @@ UPSTREAM_REF := v3.3.0
 UPSTREAM_DIR := upstream/surrealdb
 
 .DEFAULT_GOAL := help
-.PHONY: help bootstrap check test run audit-upstream clean
+.PHONY: help bootstrap check test conformance conformance-list run audit-upstream clean
 
 help: ## Show this help
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -18,8 +18,14 @@ bootstrap: ## Fetch and pin the upstream reference tree (tag v3.3.0)
 check: ## Type-check every crate
 	cargo check --workspace --all-targets
 
-test: ## Run the test suite
+test: ## Run the test suite (includes the upstream conformance suite)
 	cargo test --workspace
+
+conformance: ## Run only the upstream KV backend conformance suite
+	cargo test -p surrealdb-ds --test kvs
+
+conformance-list: ## List every conformance test and whether the suite will run it
+	cargo test -p surrealdb-ds --test kvs -- --list
 
 run: ## Construct our engine from the `ds+mem://` scheme and exit
 	cargo run -q -p surrealdb-ds-server -- ds+mem://

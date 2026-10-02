@@ -50,7 +50,7 @@ impl Config {
 		if self.members.len() < 3 {
 			return Err(format!("quorum group needs at least 3 members, got {}", self.members.len()));
 		}
-		if self.members.len() % 2 == 0 {
+		if self.members.len().is_multiple_of(2) {
 			return Err(format!(
 				"quorum group should have an odd member count, got {}; an even count survives no more failures than N-1",
 				self.members.len()

@@ -1,0 +1,32 @@
+# VENDORED — do not edit. See VENDOR.md next to this file.
+#
+# This manifest is the only file here that is not upstream's verbatim. Upstream
+# inherits version/authors/edition/license/repository/homepage/keywords/categories
+# and the lint table from its workspace root; standalone there is nowhere to
+# inherit from, so those fields are spelled out here with the values the
+# v3.3.0 workspace supplies. Dependency versions are the ones that workspace
+# pins. The crate body under src/ is unmodified.
+#
+# Upstream path: surrealdb/kvs-test @ v3.3.0 (238bfeb), publish = false.
+
+[package]
+name = "surrealdb-kvs-test"
+publish = false
+version = "3.3.0"
+authors = ["Tobie Morgan Hitchcock <tobie@surrealdb.com>"]
+edition = "2024"
+# BUSL-1.1 has no SPDX identifier; declare the file, as upstream does.
+license-file = "LICENSE"
+description = "The shared behaviour test suite for SurrealDB key-value store backends"
+repository = "https://github.com/surrealdb/surrealdb"
+homepage = "https://github.com/surrealdb/surrealdb"
+keywords = ["database-implementations", "data-structures", "embedded"]
+categories = ["database-implementations", "data-structures", "embedded"]
+
+[dependencies]
+inventory = "0.3.24"
+surrealdb-kvs = { version = "3.3.0" }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+libtest-mimic = { version = "0.8.2" }
+tokio = { version = "1", features = ["rt-multi-thread"] }

@@ -29,3 +29,15 @@ tracing = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+# Upstream's own backend contract suite, vendored (ADR-0005). BUSL-1.1, which is
+# why this crate is too.
+surrealdb-kvs-test = { path = "../../vendor/surrealdb-kvs-test" }
+
+# Runs the shared conformance suite against our engine. `harness = false` because
+# the suite brings its own libtest-CLI harness and registers its trials by
+# inventory rather than by #[test].
+[[test]]
+name = "kvs"
+path = "tests/kvs/main.rs"
+harness = false

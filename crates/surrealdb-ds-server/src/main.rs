@@ -9,9 +9,13 @@
 //! Phase 0. The engine is in-memory and single-node. This binary currently
 //! proves only that **registration works end to end**: it builds a registry with
 //! the upstream community backends plus ours, constructs through our scheme, and
-//! reports what it got. Serving HTTP is the next step, once we have confirmed
-//! `surrealdb-server`'s public init path accepts a caller-constructed registry
-//! (open question 3 in PROGRESS.md).
+//! reports what it got.
+//!
+//! Serving HTTP is the next step, and the seam is confirmed (R-0036):
+//! `surrealdb_server::init` takes a composer, and `TransactionBuilderFactory` is
+//! where a caller-built `Backends` registry goes — upstream's own
+//! `CommunityComposer` is three lines of delegation to `Backends::community()`.
+//! See DECISIONS.md ADR-0003.
 
 use std::process::ExitCode;
 
@@ -43,8 +47,9 @@ async fn main() -> ExitCode {
 			tracing::info!("engine ready: {}", builder.name());
 			tracing::info!(%path, "constructed storage backend through our provider");
 			println!("ok: constructed backend for {path}");
-			// TODO(phase 0b): hand this builder to surrealdb-server's init path and
-			// serve HTTP. Blocked on confirming the public init signature.
+			// TODO(phase 0b): serve HTTP. Implement `TransactionBuilderFactory` over a
+			// registry that has `DsBackend` registered, and hand a composer carrying it
+			// to `surrealdb_server::init` — that is the whole seam (R-0036).
 			ExitCode::SUCCESS
 		}
 		Err(err) => {

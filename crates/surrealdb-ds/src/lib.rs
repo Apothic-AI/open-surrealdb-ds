@@ -13,9 +13,16 @@
 //!
 //! # Current state
 //!
-//! Phase 0 architecture spike. The storage engine is **in-memory only** and
-//! single-node. Nothing here is correct, durable, or concurrent yet. See
-//! `../../PLAN.md` and `../../PROGRESS.md`.
+//! Phase 0. The engine passes upstream's own backend contract suite — 77 of 77
+//! runnable tests, against the published `surrealdb-kvs-test` vendored under
+//! `../../vendor/`. Transactions are snapshot-isolated with staged writes,
+//! read-your-writes, undo-log savepoints, and read-set validation at commit.
+//!
+//! The engine is still **in-memory and single-node**: one process, one `Mutex`,
+//! no durability, no replication, no locked reads. `safe_timestamp` is the
+//! single-node default and becomes a correctness bug the moment a second node
+//! exists. See `../../PLAN.md` for what is next and `../../PROGRESS.md` for what
+//! is verified — including what the conformance suite declines to check.
 //!
 //! # Module map
 //!
@@ -24,13 +31,14 @@
 //!
 //! - [`consensus`] — leaderless quorum commit, epochs, view change (Phase 3)
 //! - [`replicate`] — catch-up, anti-entropy, bounded recovery drain (Phase 3)
-//! - [`storage`] — local engine and object-storage durable tier (Phases 1, 4)
+//! - [`storage`] — the versioned keyspace and, later, the object-storage tier
+//!   (Phases 1, 4)
 //!
 //! Modules that are inherently tied to the upstream contract, and are the only
 //! ones that would need rewriting under Path B:
 //!
 //! - [`provider`] — `BackendProvider` registration
-//! - [`builder`] — `TransactionBuilder`
+//! - [`builder`] — `TransactionBuilder`, and the `surrealdb.ds.*` metric surface
 //! - [`txn`] — `Transactable`
 
 pub mod builder;
@@ -55,12 +63,26 @@ pub use surrealdb_kvs::{Transactable, TransactionBuilder};
 /// [`SCHEMES`] schemes constructible.
 ///
 /// ```no_run
-/// use surrealdb_kvs_any::Backends;
-/// use surrealdb_ds::DsBackend;
+/// use surrealdb_cnf::ConfigMap;
+/// use surrealdb_ds::{Backends, DsBackend};
+/// use tokio_util::sync::CancellationToken;
 ///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let mut backends = Backends::community();
 /// backends.register(DsBackend::new());
+///
 /// // "ds+mem://" now constructs through our engine.
-/// let builder = backends.construct("ds+mem://").await.unwrap();
+/// let builder = backends
+///   .new_transaction_builder("ds+mem://", CancellationToken::new(), ConfigMap::empty())
+///   .await?;
+/// let (tx, local) = builder.new_transaction(surrealdb_kvs::TransactionType::Write).await?;
+/// tx.set(b"k".as_slice().into(), b"v".to_vec()).await?;
+/// tx.commit().await?;
+/// # let _ = local;
+/// # Ok(())
+/// # }
 /// ```
 pub use provider::DsBackend;
+
+/// The result type the engine's boundary types use.
+pub type Result<T> = surrealdb_kvs::Result<T>;
