@@ -136,7 +136,36 @@ make audit-upstream # re-check published SurrealDB crates and licences,
 
 `make bootstrap` is only needed to re-read upstream's interfaces; the build does
 not depend on it, because the one crate we need from the tree is already
-vendored.
+vendored. A fresh clone builds and passes the suite with no network step beyond
+fetching crates.
+
+### Continuous integration
+
+Two workflows, because there are two different questions:
+
+| Workflow | Trigger | Question it answers |
+| --- | --- | --- |
+| `ci` | every push and PR | Does this commit still pass, reproducibly? |
+| `upstream-drift` | nightly | Does upstream still let us pass? |
+
+`ci` runs with `--locked`, so a green result means "against the `Cargo.lock` in
+this commit". It has two jobs: a fast one that runs only the conformance suite
+(it needs four small crates, not the whole of SurrealDB) and a slower one that
+type-checks, tests and lints the whole workspace — which is what proves ADR-0003,
+that our own binary carries the engine rather than a patched upstream one.
+
+`upstream-drift` is the one that earns its keep. `surrealdb-kvs` states that it
+"does not adhere to SemVer and its API is free to change and break code even
+between patch versions", and ADR-0001 exists because we were misled by a branch
+once already. So this workflow deliberately resolves against whatever is newest
+on crates.io, re-runs the suite, diffs the published crate inventory, and **files
+an issue** if anything moved — rather than leaving a red tick for someone to
+notice weeks later. It is why `make audit-upstream` writes a dated artifact rather
+than only printing.
+
+Both use no third-party actions, and the toolchain is pinned to the version the
+suite is verified against so that a rustc bump cannot be mistaken for a contract
+change.
 
 Verified at the time of writing:
 

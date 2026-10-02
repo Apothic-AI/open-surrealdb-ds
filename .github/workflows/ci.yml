@@ -1,0 +1,131 @@
+# The conformance gate.
+#
+# The project's central claim is that the engine passes upstream's own backend
+# contract suite. This workflow is what makes that claim checkable by anyone, on
+# every push, rather than a line in a log someone remembers to re-read.
+#
+# Two jobs, because they cost very different amounts:
+#
+#   conformance — the load-bearing one. Builds only `surrealdb-ds`, which depends
+#     on surrealdb-kvs plus four small crates. Seconds, not minutes.
+#   workspace   — type-checks and tests everything, including
+#     `surrealdb-ds-server`, which links `surrealdb-server` and therefore most of
+#     SurrealDB. Slow, but it is the part that proves ADR-0003: that our own
+#     binary, not a patched one, carries the engine.
+#
+# Both run `--locked`, so a result means "against the Cargo.lock in this commit"
+# and not "against whatever was newest when it ran". Watching us break is
+# `upstream-drift.yml`'s job; reproducing our own result is this file's.
+#
+# No step here needs the `upstream/` checkout. The one crate we need from the tree
+# is already vendored, which is the whole reason a fresh clone builds.
+
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+# A new push supersedes an in-flight run for the same ref; nobody wants to read a
+# result for a commit that no longer exists.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Pinned to the toolchain the suite is verified against. SurrealDB states its
+  # crates "do not adhere to SemVer and their API is free to change and break code
+  # even between patch versions" — a rustc bump is a second, confusable source of
+  # the same drift, so it is held still here and checked deliberately elsewhere.
+  RUSTUP_TOOLCHAIN: 1.95.0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  conformance:
+    name: conformance suite (upstream contract)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+          rustc --version
+          cargo --version
+
+      - name: Cache the registry and build directory
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: conformance-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            conformance-${{ runner.os }}-
+
+      - name: Run the suite
+        run: make conformance CARGO_FLAGS=--locked
+
+      - name: Run our own tests the suite does not cover
+        run: cargo test --locked -p surrealdb-ds --test serializable
+
+  workspace:
+    name: workspace check, test, clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component clippy
+          rustc --version
+
+      - name: Cache the registry and build directory
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: workspace-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            workspace-${{ runner.os }}-
+
+      - name: Type-check every crate
+        run: make check CARGO_FLAGS=--locked
+
+      - name: Run the whole suite
+        run: make test CARGO_FLAGS=--locked
+
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets -- --deny warnings
+
+      - name: The engine still constructs, and still coexists
+        run: |
+          make run CARGO_FLAGS=--locked
+          # A first-party backend, and an unknown scheme that must fail cleanly.
+          cargo run -q --locked -p surrealdb-ds-server -- memory
+          cargo run -q --locked -p surrealdb-ds-server -- rocksdb:/tmp/ci-coexist
+          if cargo run -q --locked -p surrealdb-ds-server -- bogus://x; then
+            echo "::error::an unknown datastore scheme was accepted"
+            exit 1
+          fi
+
+      - name: The published inventory still matches
+        # `audit-upstream.sh` rewrites docs/upstream-crates.md with today's date, so
+        # this only fails if a crate vanished or the script itself broke. The dated
+        # drift check that matters lives in upstream-drift.yml.
+        run: ./scripts/audit-upstream.sh
+
+      - name: Report if the committed inventory is stale
+        run: |
+          if ! git diff --quiet -- docs/upstream-crates.md; then
+            echo "::notice::docs/upstream-crates.md was stale and has been refreshed locally; commit it if the change is real"
+            git --no-pager diff -- docs/upstream-crates.md
+          fi

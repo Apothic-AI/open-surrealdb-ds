@@ -1,0 +1,221 @@
+# Watch upstream for drift.
+#
+# This project's biggest single risk is not a bug we write — it is SurrealDB
+# changing the contract underneath us. `surrealdb-kvs` states plainly that it
+# "does not adhere to SemVer and its API is free to change and break code even
+# between patch versions". ADR-0001 exists because we were misled once already;
+# ADR-0004 exists because of the second time.
+#
+# So the highest-value thing a scheduled job can do here is not re-run our own
+# tests against a known dependency set — `ci.yml` already does that. It is to
+# deliberately resolve against whatever is newest on crates.io today, find out
+# whether we still conform, and *say so*, rather than leaving a red tick for
+# someone to notice weeks later.
+#
+# That is why this workflow does not pass `--locked`: refusing to see a new
+# version would defeat its purpose. It is also why it opens an issue on failure —
+# a schedule that only goes red is a schedule nobody reads.
+#
+# Note GitHub disables scheduled workflows on repositories with no activity for
+# 60 days, and schedules can be delayed under load. A missed run is not a green
+# result; `workflow_dispatch` re-runs it on demand.
+
+name: upstream-drift
+
+on:
+  schedule:
+    # 05:17 UTC rather than 05:00: GitHub's own cron queue is saturated on the
+    # hour, and delayed runs bunch up.
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  RUSTUP_TOOLCHAIN: 1.95.0
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  drift:
+    name: newest published crates vs. our contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+
+      - name: Cache the registry and build directory
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # Deliberately not keyed on Cargo.lock: refreshing the lock is the whole
+          # point, so a nightly cache miss is the expected case and a slow one.
+          key: drift-${{ runner.os }}-${{ github.run_number }}
+          restore-keys: |
+            drift-${{ runner.os }}-
+
+      - name: Record the versions we are pinned to
+        run: |
+          ./scripts/locked-versions.sh | tee versions-before.txt
+
+      - name: Resolve against whatever is newest on crates.io
+        run: |
+          cargo update
+          ./scripts/locked-versions.sh | tee versions-after.txt
+          echo "--- surrealdb-* version changes ---"
+          diff -u versions-before.txt versions-after.txt || true
+
+      - name: Does it still build?
+        id: build
+        run: |
+          set -o pipefail
+          cargo check --workspace --all-targets 2>&1 | tee build.log
+
+      - name: Does it still pass the conformance suite?
+        id: suite
+        run: |
+          set -o pipefail
+          cargo test -p surrealdb-ds --test kvs 2>&1 | tee conformance.log
+
+      - name: Does it still pass our own tests?
+        id: own
+        run: |
+          set -o pipefail
+          cargo test -p surrealdb-ds --test serializable 2>&1 | tee own.log
+
+      - name: Has the published crate inventory changed shape?
+        id: inventory
+        run: |
+          ./scripts/audit-upstream.sh | tee audit.log
+          # The generated file carries today's date; ignore that line and compare
+          # the table itself. A missing committed baseline is not a finding.
+          if git cat-file -e HEAD:docs/upstream-crates.md 2>/dev/null; then
+            git show HEAD:docs/upstream-crates.md | grep -v '^Checked against' > inventory-committed.txt
+          else
+            echo "no committed docs/upstream-crates.md to compare against" | tee inventory.diff
+            exit 0
+          fi
+          grep -v '^Checked against' docs/upstream-crates.md > inventory-fresh.txt
+          set -o pipefail
+          diff -u inventory-committed.txt inventory-fresh.txt | tee inventory.diff
+
+      - name: Summarise
+        env:
+          BUILD: ${{ steps.build.outcome }}
+          SUITE: ${{ steps.suite.outcome }}
+          OWN: ${{ steps.own.outcome }}
+          INVENTORY: ${{ steps.inventory.outcome }}
+        run: |
+          {
+            echo "## Upstream drift — $(date -u +%Y-%m-%d)"
+            echo
+            echo "| check | result |"
+            echo "| --- | --- |"
+            echo "| builds | $BUILD |"
+            echo "| conformance suite | $SUITE |"
+            echo "| our own tests | $OWN |"
+            echo "| crate inventory | $INVENTORY |"
+            echo
+            echo "### surrealdb-* versions"
+            echo '```diff'
+            # `diff` exits 1 when the files differ, so the "no change" fallback
+            # belongs after a successful comparison, not after a failed one.
+            diff -u versions-before.txt versions-after.txt || true
+            cmp -s versions-before.txt versions-after.txt && echo "(no version change)"
+            echo '```'
+          } > summary.md
+          if [ -s inventory.diff ]; then
+            {
+              echo
+              echo "### crate inventory"
+              echo '```diff'
+              cat inventory.diff
+              echo '```'
+              echo
+              echo "A crate appearing, disappearing, or changing licence is a layout or"
+              echo "licensing change. Re-read the expectations at the end of"
+              echo "scripts/audit-upstream.sh, and ADR-0001 and ADR-0004, before trusting"
+              echo "any assumption built on it."
+            } >> summary.md
+          fi
+          for f in build conformance own; do
+            if grep -qE '^(error|error\[|test .* FAILED)' "$f.log" 2>/dev/null; then
+              {
+                echo
+                echo "### $f"
+                echo '```'
+                grep -E '^(error|error\[|test .* FAILED)' "$f.log" | head -40
+                echo '```'
+              } >> summary.md
+            fi
+          done
+          cat summary.md
+          echo >> "$GITHUB_STEP_SUMMARY"
+          cat summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Raise an issue if anything moved
+        if: >-
+          steps.build.outcome == 'failure' || steps.suite.outcome == 'failure' ||
+          steps.own.outcome == 'failure' || steps.inventory.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          BUILD: ${{ steps.build.outcome }}
+          SUITE: ${{ steps.suite.outcome }}
+          OWN: ${{ steps.own.outcome }}
+          INVENTORY: ${{ steps.inventory.outcome }}
+        run: |
+          title="upstream drift: the published crates moved out from under us"
+          body=$(printf '%s\n' \
+            "An overnight run against the newest published \`surrealdb-*\` crates did not" \
+            "pass. That is what this detector is for, so it is filed rather than left" \
+            "as a red tick." \
+            "" \
+            "| check | result |" \
+            "| --- | --- |" \
+            "| builds | $BUILD |" \
+            "| conformance suite | $SUITE |" \
+            "| our own tests | $OWN |" \
+            "| crate inventory | $INVENTORY |" \
+            "" \
+            "**Version changes**" \
+            "" \
+            '```diff' \
+            "$(diff -u versions-before.txt versions-after.txt || true; cmp -s versions-before.txt versions-after.txt && echo '(no version change)')" \
+            '```' \
+            "" \
+            "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            "" \
+            "Full output is in that run's job summary." \
+            "" \
+            "## Where to look first" \
+            "" \
+            "- \`Cargo.lock\` in the job log — what actually resolved." \
+            "- How much moved: if only one crate changed, suspect the contract; if many, suspect us." \
+            "- \`DECISIONS.md\` ADR-0001 (pin the tag) and ADR-0004 (published artifacts are the" \
+            "  arbiter, not the branch you happen to be reading). Eleven of the twelve API" \
+            "  assumptions in this project's first implementation were wrong, and a patch" \
+            "  release can do the same thing to a correct one.")
+          existing=$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            echo "drift continues; commenting on #$existing"
+            gh issue comment "$existing" --body "$body"
+          else
+            echo "opening a new issue"
+            gh issue create --title "$title" --body "$body"
+          fi
+
+      - name: Fail the run, so the failure shows in the checks list too
+        if: >-
+          steps.build.outcome == 'failure' || steps.suite.outcome == 'failure' ||
+          steps.own.outcome == 'failure' || steps.inventory.outcome == 'failure'
+        run: |
+          echo "::error::upstream drift detected; see the job summary and the issue it opened"
+          exit 1

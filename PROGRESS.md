@@ -175,6 +175,33 @@ So: 6 + 1 + 1 + 1 + 3 = 12.
    backend. Our implementation had it right by accident; it is now right by
    construction and asserted.
 
+### Continuous integration
+
+- [x] `ci.yml` — every push and PR. Two jobs: the conformance suite alone (fast,
+      four small dependencies) and the whole workspace with clippy at
+      `--deny warnings` (slow, and the one that proves ADR-0003 — our binary
+      carries the engine, not a patched upstream one). Runs `--locked`, so a green
+      result means "against the Cargo.lock in this commit".
+- [x] `upstream-drift.yml` — nightly. Resolves against whatever is newest on
+      crates.io, re-runs the suite, diffs the published crate inventory against the
+      committed one, and **files an issue** on any failure. This is the workflow
+      that matters most: `surrealdb-kvs` says its API "is free to change and break
+      code even between patch versions", so the real risk is upstream drift, not a
+      bug we write. It deliberately does *not* pass `--locked`.
+- [x] `scripts/locked-versions.sh` — reports the resolved `surrealdb-*` versions,
+      so a failing drift run says *what moved* rather than just that something
+      did. It exits non-zero if the pattern stops matching, because a helper that
+      silently finds nothing would make the detector report "no version change"
+      forever.
+- [x] No third-party actions. Toolchain pinned to 1.95.0, the version the suite is
+      verified against, so a rustc bump cannot be mistaken for a contract change.
+      `CARGO_FLAGS` was added to the Makefile so CI can pass `--locked` without
+      changing anyone's local invocation.
+- [x] Every `run:` block was extracted from the YAML and executed locally against
+      stubbed inputs before being committed. That found one real bug: the "no
+      version change" fallback was written `diff ... || echo`, and `diff` exits 1
+      *when the files differ*, so the message printed exactly when it was false.
+
 ### Next action
 
 Wire the composer (R-0036) and serve HTTP: `/health`, `/ready`, `/version`, then
