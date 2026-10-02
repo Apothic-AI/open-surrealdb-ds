@@ -270,14 +270,101 @@ An intermediate version of this had a dead `Err` match arm that made the poison
 unreachable, so the flag was never set and the crate did not compile under
 `--deny warnings`. Caught by clippy, not by a test.
 
+---
+
+## 2026-10-02 (later still) — Phase 0 closed: SurrealQL over HTTP on our engine
+
+`make smoke` starts the server on `ds+mem://` and passes ten checks. This was
+Phase 0's last task.
+
+```
+$ make smoke
+  ok   server is up
+  ok   /health -> 200
+  ok   /ready -> 200
+  ok   /version -> surrealdb-3.3.0
+  ok   namespace and database defined over /rpc
+  ok   CREATE over /rpc
+  ok   SELECT over /rpc
+  ok   the created document is readable back with its value
+  ok   an unknown RPC method is reported as an error
+  ok   an unknown database is refused, not silently accepted
+
+smoke: all checks passed against ds+mem:// over HTTP
+```
+
+### The seam turned out to be one generic parameter
+
+`surrealdb_server::init` takes a composer implementing `TransactionBuilderFactory
++ RouterFactory + ConfigCheck + ObservabilityProvider`, and upstream's own
+`CommunityComposer` — a public unit struct — satisfies all four. So
+`crates/surrealdb-ds-server/src/composer.rs` **delegates three traits and
+overrides exactly one**:
+
+- `TransactionBuilderFactory` — our `Backends::community()` + `register(DsBackend)`.
+- `RouterFactory` — one call to `community_router(&[])`, which is public and is
+  what `surreal` itself serves.
+- `ConfigCheck`, `ObservabilityProvider` — delegated.
+
+That last one is the whole reason this was small: `/health`, `/ready`, `/version`,
+`/rpc`, `/export`, `/import`, `/status`, `/grpc` and `/sync` come from one public
+function rather than from anything we wrote. Reimplementing any of it would be
+reimplementing the front end, which ADR-0002 says not to do.
+
+### Three things that were not obvious, and each one cost a round trip
+
+1. **`init` builds its own tokio runtime and `block_on`s.** Our `main` was
+   `#[tokio::main]`, so calling `init` from inside it panicked with "Cannot start
+   a runtime from within a runtime". `main` is now synchronous, and the
+   construct-only path builds a short-lived runtime of its own.
+2. **We must not claim the global tracing subscriber.** Upstream's CLI installs
+   its own from `--log`; two `set_global_default` calls panic. Tracing is now
+   initialised only on the path that does not hand argv to `init`.
+3. **`/rpc` wants a JSON-RPC object, not bare SurrealQL**, and namespaces and
+   databases are not auto-created. Recorded as R-0042.
+
+### The smoke test asserts things a stub would fail
+
+Two of the checks exist specifically to catch a fake:
+
+- **An unknown database is refused.** `RETURN 1` is answered from the expression
+  without resolving the database, so it returns OK against *any* database name and
+  would make this check vacuous; the check uses a real `SELECT`. This is the one
+  that proves a real keyspace is being consulted, through our engine.
+- **An unknown RPC method errors.** A front end that swallowed errors would pass
+  every round-trip check above it.
+
+It asserts on HTTP status and response bodies, never on the server's stdout —
+a debug build prints a banner and the CLI prints a version-check result, and
+asserting on either would make it brittle.
+
+### Consequence: this binary is `surreal`
+
+`init` boots the upstream CLI over `std::env::args()`, so
+`surrealdb-ds-server start [options] <path>` and `version` and `config` are
+upstream's, not ours (R-0041). `construct-only <path>` is the one addition: it
+builds the registry, constructs, reports and exits, which keeps the Phase 0
+registration proof non-blocking now that `run` serves by design.
+
+### Phase 0 is closed
+
+All eight tasks, and all three exit-criterion commands green:
+
+```
+make check      # all crates type-check
+make test       # includes the conformance suite: 77 passed / 12 ignored
+make smoke      # SurrealQL over HTTP on our engine
+```
+
+CI gained a third job so the HTTP claim is checked on every push, not just when
+someone remembers to run it.
+
 ### Next action
 
-Wire the composer (R-0036) and serve HTTP: `/health`, `/ready`, `/version`, then
-SurrealQL over `/rpc`. Design and verified interface facts are in the working
-notes; the non-obvious part is that `surrealdb_server::init` boots the **upstream
-CLI**, so our binary inherits the `surreal` command surface, and the community
-router — including `/health`, `/ready`, `/version`, `/rpc` — is one public call
-away.
+Phase 1: the key encoding contract and a durable local backend. **Nothing so far
+is durable and L2 — byte compatibility with a real SurrealDB node, which is this
+project's stated definition of 1:1 — is unproven.** That is now the largest
+remaining risk, and it is bigger than anything left in Phase 0.
 
 ---
 

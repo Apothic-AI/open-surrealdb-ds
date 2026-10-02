@@ -6163,9 +6163,13 @@ dependencies = [
 name = "surrealdb-ds-server"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
  "surrealdb-cnf",
  "surrealdb-ds",
  "surrealdb-kvs-any",
+ "surrealdb-observe",
  "surrealdb-server",
  "tokio",
  "tokio-util",

@@ -11,6 +11,17 @@ surrealdb-ds = { path = "../surrealdb-ds" }
 surrealdb-cnf = "3.3.0"
 surrealdb-kvs-any = "3.3.0"
 surrealdb-server = "3.3.0"
+# Needed to implement `ConfigCheck`, which surrealdb-server declares with
+# #[async_trait]. Same version surrealdb-server resolves to, so one copy.
+async-trait = "0.1"
+# `ObservabilityProvider` (the server's) has `surrealdb_observe::ObservabilityProvider`
+# as a supertrait, so satisfying it means naming the supertrait. Already in the
+# graph at 3.3.0; declared here only to name it.
+surrealdb-observe = "3.3.0"
+anyhow = "1"
+# For the `Router` type `RouterFactory::configure_router` returns. Already in the
+# graph at the same version surrealdb-server uses.
+axum = "0.8"
 
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"

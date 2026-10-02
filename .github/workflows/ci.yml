@@ -75,6 +75,35 @@ jobs:
       - name: Run our own tests the suite does not cover
         run: cargo test --locked -p surrealdb-ds --test serializable
 
+  http:
+    name: SurrealQL over HTTP on our engine
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+
+      - name: Cache the registry and build directory
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: http-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            http-${{ runner.os }}-
+
+      - name: Build the server
+        run: cargo build --locked -p surrealdb-ds-server
+
+      - name: Serve, and prove a write committed and a read saw it
+        # This is the Phase 0 exit criterion: not "the router builds" but a
+        # CREATE and a SELECT over HTTP on ds+mem://, plus /health, /ready,
+        # /version, and two error cases that a stub would pass.
+        run: ./scripts/smoke-http.sh
+
   workspace:
     name: workspace check, test, clippy
     runs-on: ubuntu-latest
@@ -108,11 +137,11 @@ jobs:
 
       - name: The engine still constructs, and still coexists
         run: |
-          make run CARGO_FLAGS=--locked
+          make construct CARGO_FLAGS=--locked
           # A first-party backend, and an unknown scheme that must fail cleanly.
-          cargo run -q --locked -p surrealdb-ds-server -- memory
-          cargo run -q --locked -p surrealdb-ds-server -- rocksdb:/tmp/ci-coexist
-          if cargo run -q --locked -p surrealdb-ds-server -- bogus://x; then
+          cargo run -q --locked -p surrealdb-ds-server -- construct-only memory
+          cargo run -q --locked -p surrealdb-ds-server -- construct-only rocksdb:/tmp/ci-coexist
+          if cargo run -q --locked -p surrealdb-ds-server -- construct-only bogus://x; then
             echo "::error::an unknown datastore scheme was accepted"
             exit 1
           fi

@@ -129,7 +129,9 @@ make bootstrap      # fetch + pin the upstream reference tree (v3.3.0)
 make check          # type-check every crate
 make test           # run the test suite, including the conformance suite
 make conformance    # run only the upstream KV backend conformance suite
-make run            # construct our engine from ds+mem:// and exit
+make construct      # construct the engine from a path and exit, without serving
+make run            # serve SurrealQL on ds+mem:// over HTTP (blocks)
+make smoke          # start the server and exercise it end to end
 make audit-upstream # re-check published SurrealDB crates and licences,
                     #   regenerating docs/upstream-crates.md
 ```
@@ -178,14 +180,27 @@ test surrealds::savepoint::rollback_reverts_writes                  ... ok
 ...
 test result: ok. 77 passed; 0 failed; 12 ignored
 
-$ make run
-INFO surrealdb::core::kvs::ds: Starting kvs store in ds+mem
-INFO surrealdb_ds::provider: constructing engine scheme="ds+mem" path=""
-INFO surrealdb_ds_server: engine ready: surrealds
-ok: constructed backend for ds+mem://
+$ make construct
+INFO surrealdb_ds_server: engine ready name="surrealds"
+ok: constructed backend surrealds for ds+mem://
+
+$ make smoke
+  ok   /health -> 200
+  ok   /ready -> 200
+  ok   /version -> surrealdb-3.3.0
+  ok   CREATE over /rpc
+  ok   SELECT over /rpc
+  ok   the created document is readable back with its value
+  ok   an unknown database is refused, not silently accepted
+smoke: all checks passed against ds+mem:// over HTTP
 ```
 
-The same binary also constructs `rocksdb:`, `memory` and `ds://node1` — our
+It also serves: `surrealdb-ds-server start` is a SurrealDB server whose datastore
+can be our engine, reached through the same `BackendProvider` seam. Because
+`surrealdb_server::init` boots the upstream CLI, the command surface is
+upstream's — `start`, `version`, `config` — and only `construct-only` is ours.
+
+The same binary still constructs `rocksdb:`, `memory` and `ds://node1` — our
 provider coexists with upstream's rather than replacing it — and rejects an
 unknown scheme with a clean error.
 

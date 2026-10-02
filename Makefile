@@ -12,7 +12,7 @@ UPSTREAM_DIR := upstream/surrealdb
 CARGO_FLAGS ?=
 
 .DEFAULT_GOAL := help
-.PHONY: help bootstrap check test conformance conformance-list run audit-upstream clean
+.PHONY: help bootstrap check test conformance conformance-list run construct smoke audit-upstream clean
 
 help: ## Show this help
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -33,8 +33,16 @@ conformance: ## Run only the upstream KV backend conformance suite
 conformance-list: ## List every conformance test and whether the suite will run it
 	cargo $(CARGO_FLAGS) test -p surrealdb-ds --test kvs -- --list
 
-run: ## Construct our engine from `ds+mem://` and exit
-	cargo $(CARGO_FLAGS) run -q -p surrealdb-ds-server -- ds+mem://
+construct: ## Construct the engine from a path and exit, without serving
+	cargo $(CARGO_FLAGS) run -q -p surrealdb-ds-server -- construct-only $(or $(PATH_ARG),ds+mem://)
+
+run: ## Serve SurrealQL on `ds+mem://` over HTTP (blocks; Ctrl-C to stop)
+	cargo $(CARGO_FLAGS) run -q -p surrealdb-ds-server -- start \
+		--bind 127.0.0.1:8000 --username root --password root \
+		$(or $(PATH_ARG),ds+mem://)
+
+smoke: ## Start the server, exercise /health /ready /version and a /rpc round trip
+	@./scripts/smoke-http.sh
 
 audit-upstream: ## Re-check published SurrealDB crates and licences; rewrite docs/upstream-crates.md
 	@./scripts/audit-upstream.sh

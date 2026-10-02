@@ -30,7 +30,10 @@ writing consensus code.
 - [x] `crates/surrealdb-ds-server` builds and runs
 - [x] Vendor `surrealdb-kvs-test`, register a `TestBackend`, run the suite — done
       2026-10-02; see ADR-0005 and ADR-0006
-- [ ] Serve HTTP: `/health`, `/ready`, `/version`, then SurrealQL over `/rpc`
+- [x] Serve HTTP: `/health`, `/ready`, `/version`, then SurrealQL over `/rpc` —
+      done 2026-10-02 via a composer (R-0036), verified end to end by
+      `make smoke`, which starts the server and proves a CREATE committed and a
+      SELECT read it back
 
 ### Exit criterion
 
@@ -39,14 +42,23 @@ make check    # all crates type-check        -- PASSING
 make test     # upstream conformance suite passes against our engine   -- PASSING
 ```
 
-**Status: 7 of 8 tasks done. Both exit-criterion commands are green.** The suite
-runs 77 tests against the engine through the public provider seam; 77 pass, and 12
-are reported *ignored* by the suite's own backend-name filters — what those skips
-are is written out in PROGRESS.md rather than left to whoever reads the output.
-The remaining task is the HTTP surface, and its seam is settled:
-`surrealdb_server::init` takes a composer, and `TransactionBuilderFactory` is
-where a caller-built `Backends` registry goes (R-0036). The riskiest part of the
-project is retired.
+**Status: all 8 tasks done, and all three exit-criterion commands are green.**
+
+```
+make check      # all crates type-check
+make test       # includes the upstream conformance suite
+make smoke      # serves SurrealQL on our engine and proves a round trip
+```
+
+The engine registers as a SurrealDB backend, passes all 77 runnable tests of
+upstream's own backend contract suite, and serves the real SurrealQL front end on
+top of it. Twelve conformance tests are reported *ignored* by the suite's own
+backend-name filters; what those skips are, and what we test ourselves because of
+them, is written out in PROGRESS.md rather than left to whoever reads the output.
+
+Phase 1 is where the remaining risk lives: nothing here is durable, and L2 — byte
+compatibility with a real SurrealDB node, which is this project's definition of
+1:1 — is still unproven.
 
 ---
 

@@ -4,52 +4,49 @@
 //! binary hard-codes its set of storage backends — there is no plugin discovery.
 //! Building our own is ADR-0003.
 //!
-//! # Status
+//! # What this is
 //!
-//! Phase 0. The engine is in-memory and single-node. This binary currently
-//! proves only that **registration works end to end**: it builds a registry with
-//! the upstream community backends plus ours, constructs through our scheme, and
-//! reports what it got.
+//! A SurrealDB server whose datastore can be our engine. `surrealdb_server::init`
+//! boots the upstream CLI, so the command surface is upstream's:
 //!
-//! Serving HTTP is the next step, and the seam is confirmed (R-0036):
-//! `surrealdb_server::init` takes a composer, and `TransactionBuilderFactory` is
-//! where a caller-built `Backends` registry goes — upstream's own
-//! `CommunityComposer` is three lines of delegation to `Backends::community()`.
-//! See DECISIONS.md ADR-0003.
+//! ```text
+//! surrealdb-ds-server start [options] <path>
+//! surrealdb-ds-server version
+//! ```
+//!
+//! with `ds://` and `ds+mem://` understood in addition to every first-party
+//! scheme. The seam is the composer (R-0036); see [`composer`].
+//!
+//! Two modes, because a server blocks and Phase 0's proof must not:
+//!
+//! - `construct-only <path>` — build the registry, construct through it, report,
+//!   exit. This is what `make run` does: it proves registration works end to end
+//!   without a socket, and it is fast enough for CI.
+//! - anything else — handed to the upstream CLI verbatim, so `start` serves.
+//!
+//! Run `surrealdb-ds-server start --help` for the full option list.
+
+mod composer;
 
 use std::process::ExitCode;
 
+use surrealdb_cnf::ConfigMap;
 use surrealdb_ds::DsBackend;
-use surrealdb_cnf::config::ConfigMap;
 use surrealdb_kvs_any::Backends;
 use tokio_util::sync::CancellationToken;
 
-#[tokio::main]
-async fn main() -> ExitCode {
-	tracing_subscriber::fmt()
-		.with_env_filter(
-			tracing_subscriber::EnvFilter::try_from_default_env()
-				.unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-		)
-		.init();
+use crate::composer::DsComposer;
 
-	// Start with upstream's first-party backends so `rocksdb://` keeps working,
-	// then register ours. Registration order matters: first claimant of a scheme
-	// wins, and our schemes (`ds`, `ds+mem`) do not collide with any first-party
-	// scheme, so we cannot accidentally shadow or be shadowed.
+/// Construct one backend through the public seam and report it. Exits non-zero on
+/// failure, which is what makes it usable as a check rather than a demo.
+async fn construct_only(path: &str) -> ExitCode {
 	let mut backends = Backends::community();
 	backends.register(DsBackend::new());
 
-	let path = std::env::args().nth(1).unwrap_or_else(|| "ds+mem://".to_owned());
-
-	match backends.new_transaction_builder(&path, CancellationToken::new(), ConfigMap::default()).await {
+	match backends.new_transaction_builder(path, CancellationToken::new(), ConfigMap::default()).await {
 		Ok(builder) => {
-			tracing::info!("engine ready: {}", builder.name());
-			tracing::info!(%path, "constructed storage backend through our provider");
-			println!("ok: constructed backend for {path}");
-			// TODO(phase 0b): serve HTTP. Implement `TransactionBuilderFactory` over a
-			// registry that has `DsBackend` registered, and hand a composer carrying it
-			// to `surrealdb_server::init` — that is the whole seam (R-0036).
+			tracing::info!(name = builder.name(), "engine ready");
+			println!("ok: constructed backend {} for {path}", builder.name());
 			ExitCode::SUCCESS
 		}
 		Err(err) => {
@@ -58,4 +55,45 @@ async fn main() -> ExitCode {
 			ExitCode::FAILURE
 		}
 	}
+}
+
+// Deliberately NOT `#[tokio::main]`. `surrealdb_server::init` builds its own
+// multi-threaded runtime and `block_on`s the CLI inside it, so calling it from
+// within an existing runtime panics with "Cannot start a runtime from within a
+// runtime". The construct-only path below therefore builds a short-lived runtime
+// of its own rather than inheriting one.
+fn main() -> ExitCode {
+	let args: Vec<String> = std::env::args().collect();
+	if args.get(1).map(String::as_str) == Some("construct-only") {
+		let path = match args.get(2) {
+			Some(path) => path.clone(),
+			None => {
+				eprintln!("usage: surrealdb-ds-server construct-only <path>");
+				return ExitCode::FAILURE;
+			}
+		};
+		// Logging is initialised here and ONLY here. The CLI installs its own
+		// tracing subscriber from `--log`/`--log-format`, and two calls to
+		// `set_global_default` panic — so a process that goes on to hand argv to
+		// `init` must not have claimed it already.
+		tracing_subscriber::fmt()
+			.with_env_filter(
+				tracing_subscriber::EnvFilter::try_from_default_env()
+					.unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+			)
+			.init();
+
+		return match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+			Ok(runtime) => runtime.block_on(construct_only(&path)),
+			Err(err) => {
+				eprintln!("error: could not build a runtime: {err}");
+				ExitCode::FAILURE
+			}
+		};
+	}
+
+	// Hand the real CLI our composer. It owns argv from here, blocks, and returns
+	// the process exit code. Validation of our schemes happens inside it, through
+	// the composer's `path_valid`.
+	surrealdb_server::init(DsComposer::new())
 }
