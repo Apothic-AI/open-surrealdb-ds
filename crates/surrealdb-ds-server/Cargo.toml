@@ -1,0 +1,18 @@
+[package]
+name = "surrealdb-ds-server"
+version = "0.1.0"
+edition = "2024"
+license = "BUSL-1.1"
+description = "Binary that registers the surrealdb-ds engine and serves the SurrealQL front end on it"
+publish = false
+
+[dependencies]
+surrealdb-ds = { path = "../surrealdb-ds" }
+surrealdb-cnf = "3.3.0"
+surrealdb-kvs-any = "3.3.0"
+surrealdb-server = "3.3.0"
+
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = "0.3"

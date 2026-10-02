@@ -1,0 +1,47 @@
+opensurrealdb-ds
+Copyright 2026 The opensurrealdb-ds contributors
+
+This product includes software developed by the SurrealDB project.
+
+--------------------------------------------------------------------------------
+Upstream dependency and licensing boundary
+--------------------------------------------------------------------------------
+
+This repository is an independent, clean-room reimplementation effort. It is NOT
+affiliated with, endorsed by, or sponsored by SurrealDB Ltd.
+
+SurrealDB itself is licensed under the Business Source License 1.1, NOT under
+the Apache License 2.0. Every published SurrealDB crate (surrealdb-kvs,
+surrealdb-kvs-any, surrealdb-server, surrealdb, ...) carries
+`license = "non-standard"` on crates.io, which resolves to BUSL-1.1:
+
+    Licensor:             SurrealDB Ltd.
+    Licensed Work:        SurrealDB 3.0
+    Additional Use Grant: You may make use of the Licensed Work, provided that
+                          you may not use the Licensed Work as a Database
+                          Service.
+    Change Date:          2030-01-01
+    Change License:       Apache License, Version 2.0
+
+Three consequences drive the structure of this repository:
+
+  1. Code in this repository that was written here is licensed Apache-2.0 (see
+     LICENSE). It is derived from public *documentation*, *release notes*, and
+     black-box *observation* only. No SurrealDB source code has been read,
+     copied, or translated. See PROVENANCE.md.
+
+  2. Any crate in this repository that LINKS a SurrealDB crate becomes a
+     derivative work of BUSL-1.1 code and is subject to BUSL-1.1, not
+     Apache-2.0. Those crates are marked with `license = "BUSL-1.1"` in their
+     Cargo.toml and are listed in DECISIONS.md (ADR-0002). The Apache-2.0
+     grant does not extend to them.
+
+  3. The Apache-2.0 grant in LICENSE covers only the work authored in this
+     repository and does not imply any permission regarding SurrealDB's own
+     code or trademarks.
+
+SurrealDB is a trademark of SurrealDB Ltd. This project uses the name
+SurrealDB only to identify the system whose observable behaviour it targets.
+No trademark rights are granted or claimed by BUSL-1.1 or by this NOTICE.
+
+Reference: https://surrealdb.com/legal

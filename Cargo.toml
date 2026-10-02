@@ -1,0 +1,18 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/surrealdb-ds",
+    "crates/surrealdb-ds-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+surrealdb-kvs = "3.3.0"
+surrealdb-kvs-any = "3.3.0"
+surrealdb-cnf = "3.3.0"
+surrealdb-server = "3.3.0"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"

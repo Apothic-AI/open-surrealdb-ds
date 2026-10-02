@@ -1,0 +1,5 @@
+/target/
+/upstream/surrealdb/
+**/*.rs.bk
+*.surql.tmp
+.DS_Store

@@ -1,0 +1,31 @@
+# opensurrealdb-ds — clean-room distributed storage engine for SurrealDB
+#
+# Links upstream SurrealDB crates (surrealdb-kvs, surrealdb-kvs-any), which are
+# licensed BUSL-1.1, not Apache-2.0. This crate is therefore a derivative work
+# and is licensed BUSL-1.1. See ../NOTICE and ../DECISIONS.md ADR-0002.
+#
+# If ADR-0002 resolves to "Path B", remove the surrealdb-* dependencies, change
+# this license field to "Apache-2.0", and reimplement the boundary types in
+# src/boundary/. The algorithmic modules do not need to change.
+
+[package]
+name = "surrealdb-ds"
+version = "0.1.0"
+edition = "2024"
+license = "BUSL-1.1"
+description = "Clean-room distributed key-value storage engine implementing the SurrealDB KV contract"
+publish = false
+
+[dependencies]
+# The contract we implement.
+surrealdb-kvs = "3.3.0"
+# The registry + plug-in trait we register into.
+surrealdb-kvs-any = "3.3.0"
+# Config primitives used by ConnectContext.
+surrealdb-cnf = "3.3.0"
+
+tokio = { version = "1", features = ["sync", "rt", "macros"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
