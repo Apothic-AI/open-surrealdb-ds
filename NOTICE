@@ -7,8 +7,8 @@ This product includes software developed by the SurrealDB project.
 Upstream dependency and licensing boundary
 --------------------------------------------------------------------------------
 
-This repository is an independent, clean-room reimplementation effort. It is NOT
-affiliated with, endorsed by, or sponsored by SurrealDB Ltd.
+This repository is an independent reimplementation effort. It is NOT affiliated
+with, endorsed by, or sponsored by SurrealDB Ltd.
 
 SurrealDB itself is licensed under the Business Source License 1.1, NOT under
 the Apache License 2.0. Every published SurrealDB crate (surrealdb-kvs,
@@ -32,22 +32,29 @@ repository where SurrealDB source code is a build input. Vendoring it is
 recorded as a decision in DECISIONS.md (ADR-0005); the wider firewall — that
 `upstream/surrealdb/` is a reference and never a build input — is unchanged.
 
-Four consequences drive the structure of this repository:
+There are three licensing paths in this repository, and this NOTICE states all
+three. Four consequences follow:
 
-  1. Code in this repository that was written here is licensed Apache-2.0 (see
-     LICENSE). It is derived from public *documentation*, *release notes*, and
-     black-box *observation* only. No SurrealDB source code has been read,
-     copied, or translated. See PROVENANCE.md.
+  1. CODE AUTHORED HERE is licensed Apache-2.0 (see LICENSE). It is derived from
+     public *documentation*, *release notes*, *published crate interfaces*, and
+     black-box *observation*. SurrealDB source is read for interface shape only
+     and is never copied or translated into code written here. PROVENANCE.md
+     records, per requirement, how each was established — including two of our
+     own mistakes, which are recorded rather than edited away.
 
-  2. Any crate in this repository that LINKS a SurrealDB crate becomes a
-     derivative work of BUSL-1.1 code and is subject to BUSL-1.1, not
-     Apache-2.0. Those crates are marked with `license = "BUSL-1.1"` in their
-     Cargo.toml and are listed in DECISIONS.md (ADR-0002). The Apache-2.0
-     grant does not extend to them.
+  2. CODE LINKING A SURREALDB CRATE becomes a derivative work of BUSL-1.1 code
+     and is subject to BUSL-1.1, not Apache-2.0. Those crates are marked
+     `license = "BUSL-1.1"` in their Cargo.toml and the decision is recorded in
+     DECISIONS.md (ADR-0002). The Apache-2.0 grant does not extend to them.
 
-  3. The Apache-2.0 grant in LICENSE covers only the work authored in this
-     repository and does not imply any permission regarding SurrealDB's own
-     code or trademarks.
+  3. VENDORED CODE is BUSL-1.1 and is neither relicensed nor modified. As
+     described above, `vendor/surrealdb-kvs-test/` is a verbatim copy of upstream
+     source, shipped under its own LICENSE. Nothing in it is covered by this
+     project's Apache-2.0 grant, and nothing in it was authored here.
+
+  4. The Apache-2.0 grant in LICENSE covers only the work authored in this
+     repository. It does not imply any permission regarding SurrealDB's own code
+     or trademarks, and it does not extend to items 2 or 3 above.
 
 SurrealDB is a trademark of SurrealDB Ltd. This project uses the name
 SurrealDB only to identify the system whose observable behaviour it targets.

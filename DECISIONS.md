@@ -209,9 +209,12 @@ providers compiled in.
    upstream release becomes a merge. Rejected for now.
 2. **Link the crates and ship our own binary.** Verified in Phase 0:
    `surrealdb-ds-server` builds a `Backends` from `community()`, calls
-   `register(DsBackend::new())`, and constructs through our scheme. Remaining
-   question is whether `surrealdb-server` exposes an init path that accepts a
-   caller-built registry, or builds its own internally.
+   `register(DsBackend::new())`, and constructs through our scheme. The open
+   question — whether `surrealdb-server` exposes an init path that accepts a
+   caller-built registry — was **answered 2026-10-02**: it does, and the seam is
+   one generic parameter. `surrealdb_server::init` takes a composer implementing
+   `TransactionBuilderFactory`, and upstream's own `CommunityComposer` impl of
+   that trait is a three-line delegation to `Backends::community()`. See R-0036.
 3. **Patch the upstream binary.** No supported seam. Rejected.
 
 ### Decision

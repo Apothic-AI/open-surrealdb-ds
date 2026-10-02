@@ -271,8 +271,30 @@ pub async fn build_with_path(self, path: &str) -> Result<Datastore> {
 ### 9b.3 The whole server boot is generic over the composer
 `surrealdb/server/src/cli/start.rs:213`: `C: TransactionBuilderFactory + RouterFactory`, threaded through `build_observability::<C>`, `dbs::init::<C>`, and router construction. Additional composer hooks observed: `BucketStoreProvider`, `ObservabilityProvider` (`create_observer_with_runtime`, `audit_counters`, `slow_query_counters`), `check_config`, `live_query_broker`, `datastore_node_id`, `http_endpoint`, `endpoint_resolver`.
 
+> **Re-verified at v3.3.0 against published artifacts, 2026-10-02.** These notes
+> were taken from a source tree, which ADR-0004 says is a hypothesis. The claim
+> holds: `surrealdb_server::init` at 3.3.0 is
+> `init<C: TransactionBuilderFactory + RouterFactory + ConfigCheck + ObservabilityProvider>`
+> (`surrealdb-server` 3.3.0 `lib.rs`), and `TransactionBuilderFactory` at
+> `surrealdb-core` 3.3.0 `kvs/ds.rs:460` carries `datastore_node_id`,
+> `live_query_broker` and `http_endpoint` with the defaults described here —
+> `CommunityComposer` returns a `LocalMessageBroker`, and `None` for the node id
+> and endpoint. `endpoint_resolver` is real but is **not** a method on that trait:
+> at v3.3.0 it is `dbs::NodeEndpointResolver`, a single-method trait
+> (`resolve(target_node) -> Option<String>`, catalog-backed) handed to a broker
+> through `dbs::BrokerRoutingContext` once the `Datastore` exists — alongside the
+> local node id a broker uses to skip delivering to itself. So the relay broker
+> and the endpoint resolver meet *after* the datastore is built, not at composer
+> time. Recorded as R-0036 and R-0037.
+
 ### 9b.4 Public comments name the absent implementation
-Verbatim from `core/src/kvs/ds/builder.rs`:
+
+Quoted verbatim from `core/src/kvs/ds/builder.rs`. Those are SurrealDB's words,
+under BUSL-1.1 — see `../../NOTICE`. They are quoted here, not adapted, and
+nothing in this repository's code is derived from them; the requirement records
+in `../../PROVENANCE.md` cite the same file for interface shape only (class
+`SRC`).
+
 - "Pull the local node's public HTTP endpoint from the composer (**clustered editions** surface it from their topology config). Persisted on every `Node` row this datastore writes so other cluster members can discover it via the catalog."
 - "Resolve the broker once: explicit `with_live_query_broker` wins, otherwise let the composer decide (**community returns a `LocalMessageBroker`, enterprise returns its relay broker**)."
 - "WASM doesn't run **clustered brokers** and its transaction types aren't `Send + Sync`".

@@ -176,7 +176,9 @@ throughout.
 - [ ] Node registry and peer discovery. `TransactionBuilderFactory::http_endpoint()`
       is where a node publishes the endpoint it wants recorded on its `Node` catalog
       row, and `datastore_node_id()` is what makes live-query ownership routable
-      (R-0037)
+      (R-0037). Resolution of a *peer's* endpoint is a separate thing —
+      `dbs::NodeEndpointResolver`, handed to the broker after the datastore is
+      built (R-0038)
 - [ ] Distributed live queries — `TransactionBuilderFactory::live_query_broker()`
       rather than the default local broker (R-0037)
 - [ ] Rolling upgrade with no downtime

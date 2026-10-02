@@ -251,6 +251,13 @@ distributed phases attach rather than the KV crate:
 | `live_query_broker()` | forward notifications to other nodes instead of the default local broker | 4 |
 | `http_endpoint()` | the endpoint to record on this node's `Node` catalog row, so peers can find it | 4 |
 
+One thing that is *not* a composer hook, and is easy to assume is: peer endpoint
+resolution. `dbs::NodeEndpointResolver` is a single-method trait
+(`resolve(target_node) -> Option<String>`, backed by the catalog) handed to a
+broker through `dbs::BrokerRoutingContext` — after the `Datastore` exists, since
+that is where `http_endpoint()` above lands. So a relay broker and the resolver it
+needs are wired at datastore-build time, not at composer-construction time.
+
 ---
 
 ## The conformance suite
