@@ -8,6 +8,141 @@ Status legend: `[x]` done and verified · `[~]` in progress · `[ ]` not started
 
 ---
 
+## 2026-10-04 — L2 is evidenced: 55 keys round-trip upstream → us → upstream, byte for byte
+
+**The project's stated definition of 1:1 is no longer an untested assumption.**
+`make golden` drives a real SurrealQL workload through a real `Datastore` against
+upstream's own `rocksdb:` engine, dumps the whole keyspace, replays those exact
+bytes into our in-memory tier, reads them back, and replays our output into a
+second upstream store as a control.
+
+```
+$ make golden
+round trip: 55 keys / 1526 value bytes survived upstream -> ds+mem:// -> upstream
+golden: upstream and our engine both match …/tests/data/golden-3.3.0.txt
+  # 35 of 55 keys pinned, carrying 1060 of 1526 value bytes
+versions: both tiers agree across 9 steps
+test result: ok. 3 passed; 0 failed
+```
+
+### The premise of Phase 1 was wrong, and that is the headline
+
+Phase 1 opened with *reconstruct the key encoding contract from the published
+interface* (`surrealdb-kvs`'s `key`/`value` modules). **There is nothing to
+reconstruct.** That crate's own `lib.rs`: *"This crate defines how a key and a
+value is **declared**; it does not declare any."* `KVKey::encode_buffer` and
+`KVValue::kv_encode_value` are traits; the layout is declared one level up by
+`surrealdb-datastore`'s `keyspace!` invocation, encoded by
+`surrealdb-keyspace-macro` — all published, all already in our lock file.
+Recorded as R-0044. PLAN.md's task is deleted rather than attempted.
+
+And because `Transactable` is byte-level — a key *is* a `Cow<[u8]>` — byte
+compatibility is **faithful passthrough** (R-0045). Writing our own encoder would
+have been strictly worse: more code, more risk, and a busier reading of the
+clean-room line for no gain.
+
+### The oracle was already in our binary
+
+`surrealdb-kvs-rocksdb` and `surrealdb-datastore` were in `Cargo.lock`
+transitively via `surrealdb-server`, so `construct-only rocksdb:<path>` runs
+upstream's real engine and writes upstream's real files — verified, not assumed.
+A "dataset written by upstream" costs no second checkout and no Enterprise
+licence. Separately, `surrealdb_server::core` reaches `surrealdb_core`, so
+`core::kvs::Builder::build_with_factory_path` builds a `Datastore` against any
+registry in-process: no argv, no global tracing subscriber, no version check, no
+socket (R-0046).
+
+### Replay, don't regenerate — the one decision that was load-bearing
+
+The harness was first written to *generate* the dataset on both tiers and
+compare. Measured: the same workload run twice against upstream's own `rocksdb:`
+gives 55 keys of which only **35** are identical; the other 20 mint a fresh
+`Uuid::new_v7()` per run. Masking them is worse than leaving them — `new_v7()`
+embeds a millisecond timestamp, so runs share high bytes and a pinned subset goes
+stale within minutes. So the harness **copies**: author once, dump, replay those
+bytes through us, then replay our output back into upstream as a control. Every
+key and value is compared with no exclusions, because the compared bytes were
+copied rather than independently regenerated.
+
+### What the dataset actually contains
+
+Not a toy, and checked by decoding the pinned keys rather than by intent:
+graph edge documents plus the `~` keys on **both** endpoints, a unique index and
+its `+{ix}` entries, an **HNSW vector index** with its `!hr` graph-layer records
+and serialised `[1.0, 2.0, 3.0]` vectors, record documents, doc-id mappings,
+table and field definitions, and a tombstone. A second test walks both tiers
+through nine steps — absent → v1 → reader pinned at v1 → v2 → delete → recreate
+over tombstone → scan — and asserts the pinned reader still reads v1. That is the
+case most likely to expose a bug in our version lists, and the tiers agree.
+
+### Falsifiability, verified rather than asserted
+
+A single flipped bit injected into `DsTxn::set` for 172-byte values was tried
+twice and reverted. Both probes failed **two of the three** golden tests, at the
+injected offset, with the injected mask:
+
+| Probe | Injected | Key hit | Reported |
+| --- | --- | --- | --- |
+| 1 | `if val.len() == 123 { val[7] ^= 0x01; }` | `*knows*edge_one` | byte 7, `expected 00, found 01` |
+| 2 | `if val.len() == 172 { val[100] ^= 0x01; }` | `*person*one` | byte 100, `expected 6d, found 6c` |
+
+I re-ran probe 2 independently rather than trusting the report, and confirmed the
+value is 172 bytes and byte 100 is the terminating `m` of `"one@example.com"`.
+`git diff crates/surrealdb-ds/` is empty. **A harness that cannot fail is
+decoration**, and this one demonstrably can.
+
+### What this does NOT prove
+
+1. **No key class is proven complete.** Only the classes this workload reaches. A
+   class upstream writes that it never touches is untested, and *no failure would
+   announce it*.
+2. **The manifest pins 35 of 55 keys, not all.** The 20 unpinned carry a per-run
+   UUID — `!tb{tb}`, where `PERMISSIONS` lives, among them. Their bytes are still
+   compared absolutely by the round trip; they are simply not in the committed
+   file.
+3. **No multi-version count is verified.** The KV surface cannot report one; our
+   tier refuses `version` arguments. The version leg compares observable
+   behaviour differentially, not version bytes.
+4. **In-memory only.** Durability, recovery, and the on-disk format are Phase 1
+   task 2 and are untouched.
+5. **Upstream's RocksDB was unversioned throughout.** A plain `rocksdb:` path
+   installs neither the UDT comparator nor `set_timestamp(u64::MAX)` —
+   `RocksDbConfig::versioned` defaults to `false` (R-0048), confirmed in the
+   `OPTIONS` file as `comparator=leveldb.BytewiseComparator`. So this says
+   nothing about the `surrealdb.TimestampComparator` path, which is opt-in behind
+   `?datastore_versioned=true`.
+
+### Two corrections to my own briefing
+
+The delegated agent found an error in the brief I wrote it, and was right:
+
+- I asserted the on-disk format *is* the UDT layout. It is opt-in; I had
+  verified it against an unversioned open. R-0048.
+- I mis-decoded a key as `/*{ns}!db{db}person*…`; it is `/*{ns}*{db}*person\0*\x03one\0`
+  — four `*` separators, no `!db`.
+
+It also found that **our refusal of versioned reads is upstream's own position**:
+`surrealdb-kvs-mem` rejects `datastore_versioned` at startup with
+`UnsupportedVersionedQueries` (R-0049). That reframes PLAN.md's versioned-read
+task from a conformance gap into a design decision — implementing time-travel
+would make our tier *diverge* from upstream's local tier.
+
+### Baseline intact
+
+`make check` 0 warnings · `cargo clippy --workspace --all-targets -- --deny warnings`
+clean · `make test` 19 + 77 + 12 ignored + 6 + 2 + **3** + 1, 0 failed ·
+`make smoke` 10/10 against `ds+mem://` over HTTP. The engine crate
+`crates/surrealdb-ds/` is **untouched** by this work, and `storage.rs` still
+never imports `surrealdb_kvs`.
+
+### Next action
+
+Phase 1's durable backend, with the scope question ADR-0007 deliberately leaves
+open: whether L2 means our files must be interchangeable with upstream's, or
+only that our tier preserves the bytes it is handed. Nothing here answers it.
+
+---
+
 ## 2026-10-02 — Phase 0 conformance: the engine passes the upstream suite
 
 **Phase 0's remaining exit criterion is met.** `make test` runs upstream's own

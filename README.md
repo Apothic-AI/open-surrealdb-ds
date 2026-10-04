@@ -82,11 +82,24 @@ Three levels are possible. We target **L2**.
 | Level | Meaning | Reachable? |
 | --- | --- | --- |
 | **L1** | Behavioural equivalence over the client surface: SurrealQL results, error shapes, transaction outcomes, `/metrics` names, `/health` + `/ready` | Yes — fully black-box verifiable |
-| **L2** | Datastore byte compatibility: identical key encoding, so our node and a real SurrealDB node read and write the same data | Yes — the key/value encoding contract is a published interface |
+| **L2** | Datastore byte compatibility: identical key encoding, so our node and a real SurrealDB node read and write the same data | Yes — and now **evidenced** by `make golden`: 55 keys / 1526 value bytes round-trip upstream → us → upstream byte for byte |
 | **L3** | Wire identity with the real inter-node mesh: QUIC framing, message-class partitioning, consensus wire messages | **No** — encrypted QUIC between nodes cannot be observed without a licence |
 
 **L2 is the definition of 1:1 for this project.** L3 is not reachable clean-room
 and we do not attempt to guess at it.
+
+**What the L2 evidence covers, precisely.** Byte fidelity *at the KV boundary*:
+`Transactable` is byte-level, so our tier stores and returns the bytes it is
+handed, and the harness proves that against bytes upstream's own engine wrote.
+Covered: graph edges, a unique index, an HNSW vector index with its serialised
+vectors, record documents, definitions, tombstones, and version lists across nine
+steps including a reader pinned at an older version.
+
+Not covered, and not to be read as covered: **on-disk format compatibility**
+(our tier is still in-memory), **completeness of the keyspace** (only the key
+classes the test workload reaches), and **durability of any kind**. `make golden`
+is falsifiable — a single flipped bit in our write path fails it — but a green run
+is evidence about bytes, not a claim of equivalence. See `DECISIONS.md` ADR-0007.
 
 ---
 
@@ -129,6 +142,7 @@ make bootstrap      # fetch + pin the upstream reference tree (v3.3.0)
 make check          # type-check every crate
 make test           # run the test suite, including the conformance suite
 make conformance    # run only the upstream KV backend conformance suite
+make golden         # round-trip a dataset through upstream -> us -> upstream, byte for byte
 make construct      # construct the engine from a path and exit, without serving
 make run            # serve SurrealQL on ds+mem:// over HTTP (blocks)
 make smoke          # start the server and exercise it end to end
@@ -154,7 +168,11 @@ Two workflows, because there are two different questions:
 this commit". It has two jobs: a fast one that runs only the conformance suite
 (it needs four small crates, not the whole of SurrealDB) and a slower one that
 type-checks, tests and lints the whole workspace — which is what proves ADR-0003,
-that our own binary carries the engine rather than a patched upstream one.
+that our own binary carries the engine rather than a patched upstream one. That
+slower job also names `make golden` as its own step: those tests already run
+under `make test --workspace`, but their output is captured, and the project's
+central claim deserves a legible line in the run list rather than hiding inside a
+test count.
 
 `upstream-drift` is the one that earns its keep. `surrealdb-kvs` states that it
 "does not adhere to SemVer and its API is free to change and break code even

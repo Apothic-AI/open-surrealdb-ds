@@ -59,7 +59,12 @@ use tokio_util::sync::CancellationToken;
 /// Our schemes (`ds`, `ds+mem`) do not collide with any first-party scheme, so
 /// registering ours cannot shadow one — and registering after `community()`
 /// means first-party schemes keep winning their own, which is what we want.
-fn registry() -> Backends<'static> {
+///
+/// Public because the golden-file harness (`tests/golden.rs`) needs the same
+/// registry the binary serves from, and because `construct-only` on the binary
+/// needs it too: three copies of this list would be three places to change when
+/// our schemes change.
+pub fn registry() -> Backends<'static> {
 	let mut backends = Backends::community();
 	backends.register(DsBackend::new());
 	backends

@@ -13,6 +13,12 @@
 #     SurrealDB. Slow, but it is the part that proves ADR-0003: that our own
 #     binary, not a patched one, carries the engine.
 #
+# The golden-file round trip is named as its own step in `workspace` rather than
+# given a job of its own. `make test --workspace` already runs it — a separate job
+# would rebuild the whole of SurrealDB a second time to say the same thing — and
+# naming it is what stops L2 being an untested assumption that only shows up in a
+# log somebody reads carefully.
+#
 # Both run `--locked`, so a result means "against the Cargo.lock in this commit"
 # and not "against whatever was newest when it ran". Watching us break is
 # `upstream-drift.yml`'s job; reproducing our own result is this file's.
@@ -131,6 +137,16 @@ jobs:
 
       - name: Run the whole suite
         run: make test CARGO_FLAGS=--locked
+
+      - name: Byte compatibility with a real SurrealDB node (L2)
+        # Named separately because it is the project's definition of 1:1 and
+        # because a failure here means something no other job would catch: our
+        # storage tier mangled bytes upstream handed it.
+        #
+        # Already covered by `make test --workspace` above; repeated here so the
+        # claim has a name in the run list rather than hiding in a test count.
+        # Ten seconds. Cheaper than the job a separate workflow would need.
+        run: make golden CARGO_FLAGS=--locked
 
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- --deny warnings

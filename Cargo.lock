@@ -6168,6 +6168,7 @@ dependencies = [
  "axum",
  "surrealdb-cnf",
  "surrealdb-ds",
+ "surrealdb-kvs",
  "surrealdb-kvs-any",
  "surrealdb-observe",
  "surrealdb-server",

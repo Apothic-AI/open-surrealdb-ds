@@ -110,6 +110,12 @@ and a date. Add new records as work proceeds; never edit a citation in place.
 | R-0042 | `/rpc` with `Content-Type: application/json` requires a JSON-RPC **object** body — the query goes in `params`, not as a bare SurrealQL string. There is no auto-create of namespaces or databases, and `RETURN` is evaluated without resolving the database, so it returns OK against any database name | PUBAPI | `surrealdb-server` 3.3.0 `src/rpc/format.rs`, `src/ntw/headers/content_type.rs`; verified against a running server | 2026-10-02 | recorded, verified |
 | R-0043 | A live transaction must pin its snapshot stamp; collection may then retain only the newest version at or below the oldest pinned stamp, because for any live snapshot at or above the horizon every older version is shadowed by it | SRC | `crates/surrealdb-ds/src/storage.rs` module docs; sufficiency argument recorded in-file | 2026-10-02 | recorded, implemented, tested |
 | R-0038 | A relay broker and the endpoint resolver meet **after** the datastore is built, not at composer time: `dbs::NodeEndpointResolver` (`resolve(target_node) -> Option<String>`, catalog-backed) is handed to the broker through `dbs::BrokerRoutingContext`, alongside the local node id the broker uses to skip delivering to itself | PUBAPI | `surrealdb-core` 3.3.0 `dbs/broker.rs` | 2026-10-02 | recorded |
+| R-0044 | `surrealdb-kvs`'s `key` and `value` modules declare a *mechanism*, not a layout: `KVKey::encode_buffer` / `KVKeyDecode` / `KVValue::kv_encode_value` are traits each key and value type implements, and nothing in the crate says what a namespace or an index is. The engine's keyspace is declared one level up, by a single `keyspace!` invocation in `surrealdb-datastore` | PUBAPI | `surrealdb-kvs` 3.3.0 `src/lib.rs`, `src/key/mod.rs`; `surrealdb-datastore` 3.3.0 `src/key/mod.rs`, `src/key/schema.rs`, `src/key/keyspace.map` | 2026-10-04 | recorded, relied on |
+| R-0045 | `Transactable` at v3.3.0 is **byte-level**: `set(key: Key, val: Val)`, `get(key, version) -> Option<Val>`, `scan(KeyRange, …) -> Vec<(Vec<u8>, Val)>`. A key `is` a `Cow<[u8]>` (`Key<'a>`), so the query layer above the seam hands a backend already-encoded bytes and the backend never decodes. Byte compatibility is therefore faithful passthrough, not a re-implementation of an encoder | PUBAPI | `surrealdb-kvs` 3.3.0 `src/api.rs`, `src/types.rs` | 2026-10-04 | recorded, load-bearing for L2 |
+| R-0046 | A datastore can be built in-process against **any** `Backends` registry without `surrealdb_server::init`: `surrealdb_server` re-exports `surrealdb_core` as `surrealdb_server::core`, and `core::kvs::Builder::build_with_factory_path(path, composer)` takes a `TransactionBuilderFactory` — the same seam `init` uses. No argv, no global tracing subscriber, no online version check, no socket. `Datastore::execute` runs SurrealQL and `Datastore::transaction` opens a `Transaction` whose `scan_raw` reads a `RawRange` as `(key, bytes)` pairs | PUBAPI | `surrealdb-server` 3.3.0 `src/lib.rs:68`; `surrealdb-core` 3.3.0 `src/kvs/ds/builder.rs`, `src/kvs/ds.rs`; `surrealdb-datastore` 3.3.0 `src/tx.rs` `scan_raw` | 2026-10-04 | recorded, used |
+| R-0047 | `new_transaction_builder` is what **opens** a store: `ds+mem://` constructs a fresh in-memory tier per call, so writing and then reading back through two calls compares a populated store against an empty one. Anything that must see its own writes has to hold one `TransactionBuilder` for both | PUBAPI | `surrealdb-kvs-any` 3.3.0 `Backends::new_transaction_builder`; observed in `crates/surrealdb-ds/src/builder.rs` `DsTransactionBuilder::connect` | 2026-10-04 | recorded, verified by the golden harness |
+| R-0048 | `surrealdb-kvs-rocksdb` is **unversioned by default** (`RocksDbConfig::versioned = false`), so a plain `rocksdb:` path installs neither the `surrealdb.TimestampComparator` user-defined-timestamp comparator nor `set_timestamp(u64::MAX)`. Verified in the `OPTIONS` file a plain construction writes: `comparator=leveldb.BytewiseComparator`. The UDT layout applies only to `?datastore_versioned=true` | PUBAPI | `surrealdb-kvs-rocksdb` 3.3.0 `src/cnf.rs` `RocksDbConfig::default`, `Config::parse` (`datastore_versioned`); `src/comparator.rs` | 2026-10-04 | recorded, verified |
+| R-0049 | A datastore built through the KV contract and left on its defaults refuses versioned reads: `surrealdb-kvs-mem` rejects `datastore_versioned` at startup with `Error::UnsupportedVersionedQueries`, and both mem and rocksdb default it off. Our tier's refusal of a `version` argument is therefore upstream's own position for a backend registered without versioning, not a gap we invented | PUBAPI | `surrealdb-kvs-mem` 3.3.0 `src/lib.rs` `Datastore::new`; `src/cnf.rs` | 2026-10-04 | recorded |
 
 ---
 
@@ -126,6 +132,43 @@ black-box observation (`OBS`), which has not started.
 | `safe_timestamp` semantics under partial commit visibility | Live-query correctness | 2 |
 | Read-your-writes guarantees across nodes after a quorum commit | Stale reads would break SurrealQL semantics | 3 |
 | Behaviour under clock skew | HLC-based timestamps are advertised | 3 |
+
+### Closed by the golden-file harness, and how far
+
+The first two gaps are **no longer gaps in the sense that mattered**, and it is
+worth being precise about what changed. They were written as gaps because the
+encoding was unknown. It is not unknown: `surrealdb-datastore`'s `keyspace!`
+invocation declares it (R-0044), and the layer above the seam hands a backend
+already-encoded bytes (R-0045), so **we never need to know it**. What Phase 1 had
+instead was no *evidence* that the bytes we hold are the bytes a real SurrealDB
+node holds.
+
+`crates/surrealdb-ds-server/tests/golden.rs` is that evidence, and it is
+`make golden`:
+
+- A real `Datastore` runs real SurrealQL against upstream's own `rocksdb:`
+  (R-0046), the whole keyspace is dumped, and those exact bytes are replayed
+  through `ds+mem://` and read back. Every key and every value is compared, with
+  no exclusions — the round trip compares bytes that were *copied*, not bytes a
+  run happened to *generate*.
+- The dataset covers graphs (edge documents plus the `~` keys on both endpoints),
+  a unique index, an HNSW vector index and its serialised vectors, record
+  documents, doc-id mappings, field and index definitions, and a tombstone.
+- A third store replays our output back into upstream's engine, so a failure is
+  attributable to our tier rather than to the replay mechanism.
+
+Two things it explicitly does **not** establish, recorded here so a green run is
+not read as more than it is:
+
+1. **No key class is proven complete.** The harness compares the classes this
+   workload happens to produce. A class upstream writes that this workload never
+   reaches is untested, and no failure would announce it.
+2. **The committed manifest pins 35 of the dataset's 55 keys**, not all of them.
+   The other 20 carry a fresh `Uuid::new_v7()` per run — node rows, id-sequence
+   state, index-build state, and the table definitions, which is where
+   `PERMISSIONS` lives. Those bytes *are* compared, absolutely, by the round trip;
+   they are simply not in the committed file, because no byte-pinning of a
+   value containing a millisecond timestamp survives a day.
 
 ---
 

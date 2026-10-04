@@ -27,3 +27,8 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+
+[dev-dependencies]
+# The golden-file harness names `RawRange`, `AnyRange` and `TransactionType`,
+# which live in the `Transactable` contract crate the engine already links.
+surrealdb-kvs = "3.3.0"

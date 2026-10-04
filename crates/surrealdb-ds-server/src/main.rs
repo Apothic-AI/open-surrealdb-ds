@@ -26,24 +26,16 @@
 //!
 //! Run `surrealdb-ds-server start --help` for the full option list.
 
-mod composer;
-
 use std::process::ExitCode;
 
 use surrealdb_cnf::ConfigMap;
-use surrealdb_ds::DsBackend;
-use surrealdb_kvs_any::Backends;
+use surrealdb_ds_server::{DsComposer, registry};
 use tokio_util::sync::CancellationToken;
-
-use crate::composer::DsComposer;
 
 /// Construct one backend through the public seam and report it. Exits non-zero on
 /// failure, which is what makes it usable as a check rather than a demo.
 async fn construct_only(path: &str) -> ExitCode {
-	let mut backends = Backends::community();
-	backends.register(DsBackend::new());
-
-	match backends.new_transaction_builder(path, CancellationToken::new(), ConfigMap::default()).await {
+	match registry().new_transaction_builder(path, CancellationToken::new(), ConfigMap::default()).await {
 		Ok(builder) => {
 			tracing::info!(name = builder.name(), "engine ready");
 			println!("ok: constructed backend {} for {path}", builder.name());

@@ -70,20 +70,40 @@ SurrealDB read and write the same data.
 ### Why byte compatibility matters
 
 It is the strongest available evidence that our understanding of the system is
-correct, and it is what makes L2 a meaningful definition of 1:1. The
-`key`/`value` encoding contract is a published interface in `surrealdb-kvs`, so
-this is legitimate to implement against — subject to ADR-0002.
+correct, and it is what makes L2 a meaningful definition of 1:1.
+
+**Corrected 2026-10-04.** This section previously said the `key`/`value`
+encoding contract is a published interface in `surrealdb-kvs`. It is not — that
+crate declares a *mechanism* and no layout, and says so itself. The layout is
+declared one level up by `surrealdb-datastore`'s `keyspace!` invocation. What
+makes byte compatibility legitimate to implement against is ADR-0002, not the
+existence of an encoding contract in a crate we happen to link; and because
+`Transactable` is byte-level, the work is faithful passthrough rather than
+re-encoding. See ADR-0007 and R-0044/R-0045.
 
 ### Tasks
 
-- [ ] Reconstruct the key encoding contract from the published interface
-- [ ] Local durable backend (RocksDB as a dependency of ours, not theirs)
-- [ ] Golden-file tests: dataset written by upstream, read by us, and back
+- [~] Local durable backend (RocksDB as a dependency of ours, not theirs) — the
+      next substantial task. Scope is open: see ADR-0007 for what is and is not
+      yet known about the on-disk format, including that a plain `rocksdb:` path
+      installs **no** timestamp comparator at all (R-0048)
+- [x] Golden-file tests: dataset written by upstream, read by us, and back —
+      done 2026-10-04 as `make golden`. 55 keys / 1526 value bytes round-trip
+      upstream → `ds+mem://` → upstream byte for byte, with a second upstream
+      store as a control so a failure is attributable to our tier. The committed
+      manifest pins **35 of 55** keys; the other 20 carry a per-run UUID and are
+      compared by the round trip instead. Verified falsifiable: one flipped bit
+      in `set` fails two of three tests. **Known limits:** no key class is proven
+      complete, and nothing here concerns the on-disk format. See ADR-0007
 - [x] Read-snapshot isolation (`kvs-test::snapshot`) — per-key versions and commit
       stamps, done 2026-10-02
 - [ ] Versioned (time-travel) reads (`kvs-test::versioned`) — currently *refused*
       with `UnsupportedVersionedQueries`, which is what the suite requires of every
-      backend registered without versioning, us included
+      backend registered without versioning, us included. **Reframed 2026-10-04:**
+      upstream's own `surrealdb-kvs-mem` rejects `datastore_versioned` the same
+      way (R-0049), so this is not a conformance gap. Implementing time-travel
+      would make our tier *diverge* from upstream's local tier, which makes it a
+      design decision rather than an obligation
 - [x] Version GC — live-snapshot pins, horizon-based collection, `history`
       retired; done 2026-10-02. **Known limit carried forward:** a transaction that
       is never dropped pins the horizon for ever, so a leaked `Box<dyn Transactable>`
