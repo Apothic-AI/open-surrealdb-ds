@@ -597,3 +597,107 @@ it in a day rather than after several thousand lines.
   interchange a moving target rather than a fixed contract.
 - Time-travel reads are implemented, which promotes the versioned profile from
   deferred to required and needs its own capture.
+
+---
+
+## ADR-0009 — Build on a Fly machine; it is currently blocked on a glibc base
+
+**Status:** accepted, with the final step outstanding · **Date:** 2026-10-04
+
+### Context
+
+The workstation's disk is at capacity: 898G with 18G free, of which
+`target/debug` alone is 32G — `deps` 22G, `build` 8.5G, `incremental` 1.7G, and
+a 1.8G debug `surrealdb-ds-server`. A build cannot fit its own artifacts in the
+remaining space, so local building had stopped being an option rather than
+merely being slow.
+
+`surrealdb-kvs-rocksdb` and `surrealdb-datastore` were already in `Cargo.lock`
+via `surrealdb-server`, so RocksDB 11.0.0 was **already compiled into our
+binary**. That made a Fly builder cheap: same lockfile, same compiler, and the
+oracle we needed for ADR-0007.
+
+### Decision
+
+Compilation happens on a Fly machine reached over **2PN** (wireguard), so there
+is no public SSH port. `cargo remote-3000` rsyncs the project, runs cargo over
+ssh, and copies artifacts back **only** under `--copy-back`. `make test` and
+`make clippy` therefore return output and nothing else, which is what makes the
+trade worth making.
+
+Three things were needed to make that work, and each cost a round trip:
+
+1. **Our own OpenSSH server on port 2222.** Fly's `Hallpass` on 22 argv-splits
+   the command instead of running it through a login shell, and reads no
+   `authorized_keys` from disk. cargo-remote needs a shell twice: rsync's
+   `--rsync-path` is `mkdir -p DIR && rsync`, and its build script is
+   `cd DIR; . env; cargo ...`. A normal `sshd` also authenticates the plain
+   ed25519 key, so nothing depends on an expiring certificate or the agent.
+2. **`host` is an ssh_config alias.** cargo-remote splits its `host` field on
+   `:` to separate user from hostname, which destroys a bare IPv6 literal.
+   Its `ssh_port` field overrides `Port` in `ssh_config`, so the two must agree.
+3. **`$CARGO_HOME/env` written by hand.** `rustup --no-modify-path` does not
+   create it, and cargo-remote sources it; without it every remote build dies
+   with `ash: cargo: not found`.
+
+`ops/fly-builder/provision.sh` captures all of this and is idempotent, because
+the machine's root filesystem is ephemeral and `apk` packages do not survive a
+stop. `/data/bin/ensure-ready` exists for the same reason: `flyctl machine exec`
+argv-splits rather than using a shell, so a one-word executable on the volume is
+the only way to bootstrap in one call.
+
+### What works, and what does not
+
+Transfer, execution and the toolchain are verified: `cargo remote-3000 -r fly
+locate-project` returns the remote path, cargo/rustc/clippy are 1.95.0 — the
+version `ci.yml` pins — and most of the graph compiles remotely, C++ crates
+included.
+
+**The build does not complete, and the reason is not a missing package.**
+`rquickjs-sys`'s build script panics with `Unable to find libclang: ...
+Dynamic loading not supported`. bindgen is a build-dependency of both
+`surrealdb-librocksdb-sys` and `rquickjs-sys`, but only the former enables
+bindgen's `runtime` feature, and resolver `"3"` keeps the two feature sets
+separate — so `rquickjs-sys` gets a bindgen that must **link** libclang at build
+time rather than dlopen it. That is fine on glibc, which is what this
+workstation and upstream's CI images are, and impossible on musl. No package can
+fix it.
+
+### The outstanding step
+
+Building on glibc, Debian for parity with CI. It could not be done
+non-destructively:
+
+- `flyctl machine update --image debian:bookworm-slim` → *"deploying over the
+  remote builder is not allowed"*. The app is a registered org build machine and
+  Fly will not overwrite its own builder's image.
+- `flyctl machine create … -v builder_data:/data` → *"remote builders may have
+  only one volume"*, and the existing machine holds it.
+
+So the Debian machine requires **destroying the current one**, which also
+discards `/data` and forces a rustup reinstall. That is an owner's decision
+because it is destructive and it costs machine-time, so it is not done here.
+`ops/fly-builder/fly.glibc.toml` is the config for it.
+
+### Consequences
+
+- **`docs/remote-builds.md` is the operational reference**, and `AGENTS.md`
+  tells agents to read it before assuming remote builds work — and to check
+  whether a failure is the musl/libclang wall or something new.
+- **`make golden` has not been run remotely.** The golden harness links the
+  server binary, which is the heaviest thing we build; it is the first thing to
+  try once the base is glibc.
+- **Do not `cargo clean` locally yet.** Local building is the only working
+  builder, and reclaiming that 32G before the remote one can compile would leave
+  no way to build at all.
+- The honest summary is that this ADR buys a working *transport* and a proven
+  *diagnosis*, not yet a working *build*.
+
+### Revisit if
+
+- The Debian machine is created, at which point this becomes a routine
+  infrastructure note and the "outstanding step" section is deleted.
+- The volume limit on remote builders is lifted, which would allow a second
+  machine alongside the Alpine one and remove the need to destroy anything.
+- Local disk is reclaimed some other way, which removes the pressure that made
+  this urgent.
