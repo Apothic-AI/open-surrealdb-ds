@@ -32,8 +32,8 @@ repository where SurrealDB source code is a build input. Vendoring it is
 recorded as a decision in DECISIONS.md (ADR-0005); the wider firewall — that
 `upstream/surrealdb/` is a reference and never a build input — is unchanged.
 
-There are three licensing paths in this repository, and this NOTICE states all
-three. Four consequences follow:
+There are four licensing paths in this repository, and this NOTICE states all
+four. Four consequences follow:
 
   1. CODE AUTHORED HERE is licensed Apache-2.0 (see LICENSE). It is derived from
      public *documentation*, *release notes*, *published crate interfaces*, and
@@ -46,6 +46,14 @@ three. Four consequences follow:
      and is subject to BUSL-1.1, not Apache-2.0. Those crates are marked
      `license = "BUSL-1.1"` in their Cargo.toml and the decision is recorded in
      DECISIONS.md (ADR-0002). The Apache-2.0 grant does not extend to them.
+
+  3. A FOURTH PATH: DEPENDENCY ON A SURREALDB-MAINTAINED FORK. The interop test
+     that opens a directory upstream wrote links `surrealdb-rocksdb` -- the
+     SurrealDB fork of the Rust RocksDB binding, wrapping RocksDB 11.0.0 -- rather
+     than the public `rocksdb` crate. It is BUSL-1.1 like everything else in
+     path 2, and it is a dependency of a test target, not of the engine. It is
+     recorded separately because its name does not begin with `surrealdb-kvs`
+     and would otherwise read as an ordinary third-party crate.
 
   3. VENDORED CODE is BUSL-1.1 and is neither relicensed nor modified. As
      described above, `vendor/surrealdb-kvs-test/` is a verbatim copy of upstream

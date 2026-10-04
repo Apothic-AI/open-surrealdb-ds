@@ -143,6 +143,7 @@ make check          # type-check every crate
 make test           # run the test suite, including the conformance suite
 make conformance    # run only the upstream KV backend conformance suite
 make golden         # round-trip a dataset through upstream -> us -> upstream, byte for byte
+make interop        # open an upstream-written RocksDB directory with our own reader
 make construct      # construct the engine from a path and exit, without serving
 make run            # serve SurrealQL on ds+mem:// over HTTP (blocks)
 make smoke          # start the server and exercise it end to end

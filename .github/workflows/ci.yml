@@ -148,6 +148,18 @@ jobs:
         # Ten seconds. Cheaper than the job a separate workflow would need.
         run: make golden CARGO_FLAGS=--locked
 
+      - name: Open an upstream-written directory with our own reader (ADR-0008)
+        # The same reasoning as `make golden` above, for the other half of L2.
+        # `make test --workspace` already runs it; naming it keeps ADR-0008's
+        # premise falsifiable in the run list rather than in a commit message
+        # somebody has to remember. In particular it is the job that fails if
+        # RocksDB ever starts resolving `prefix_extractor` by name on open — see
+        # PROVENANCE.md R-0051, which records that it currently does not.
+        #
+        # No new build cost: the reader is SurrealDB's own `surrealdb-rocksdb`
+        # fork, already in the lock file and already compiled for `make golden`.
+        run: make interop CARGO_FLAGS=--locked
+
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- --deny warnings
 

@@ -12,7 +12,7 @@ UPSTREAM_DIR := upstream/surrealdb
 CARGO_FLAGS ?=
 
 .DEFAULT_GOAL := help
-.PHONY: help bootstrap check test conformance conformance-list golden golden-update run construct smoke audit-upstream clean
+.PHONY: help bootstrap check test conformance conformance-list golden golden-update interop run construct smoke audit-upstream clean
 
 help: ## Show this help
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -38,6 +38,9 @@ golden: ## Round-trip a non-trivial dataset through upstream -> us -> upstream, 
 
 golden-update: ## Rewrite the golden manifest from a fresh upstream run (review the diff)
 	DS_GOLDEN_UPDATE=1 cargo $(CARGO_FLAGS) test -p surrealdb-ds-server --test golden -- --nocapture
+
+interop: ## Open an upstream-written RocksDB directory with our own reader, byte for byte
+	cargo $(CARGO_FLAGS) test -p surrealdb-ds-server --test interop -- --nocapture
 
 construct: ## Construct the engine from a path and exit, without serving
 	cargo $(CARGO_FLAGS) run -q -p surrealdb-ds-server -- construct-only $(or $(PATH_ARG),ds+mem://)

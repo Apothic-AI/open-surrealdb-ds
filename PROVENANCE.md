@@ -116,6 +116,11 @@ and a date. Add new records as work proceeds; never edit a citation in place.
 | R-0047 | `new_transaction_builder` is what **opens** a store: `ds+mem://` constructs a fresh in-memory tier per call, so writing and then reading back through two calls compares a populated store against an empty one. Anything that must see its own writes has to hold one `TransactionBuilder` for both | PUBAPI | `surrealdb-kvs-any` 3.3.0 `Backends::new_transaction_builder`; observed in `crates/surrealdb-ds/src/builder.rs` `DsTransactionBuilder::connect` | 2026-10-04 | recorded, verified by the golden harness |
 | R-0048 | `surrealdb-kvs-rocksdb` is **unversioned by default** (`RocksDbConfig::versioned = false`), so a plain `rocksdb:` path installs neither the `surrealdb.TimestampComparator` user-defined-timestamp comparator nor `set_timestamp(u64::MAX)`. Verified in the `OPTIONS` file a plain construction writes: `comparator=leveldb.BytewiseComparator`. The UDT layout applies only to `?datastore_versioned=true` | PUBAPI | `surrealdb-kvs-rocksdb` 3.3.0 `src/cnf.rs` `RocksDbConfig::default`, `Config::parse` (`datastore_versioned`); `src/comparator.rs` | 2026-10-04 | recorded, verified |
 | R-0049 | A datastore built through the KV contract and left on its defaults refuses versioned reads: `surrealdb-kvs-mem` rejects `datastore_versioned` at startup with `Error::UnsupportedVersionedQueries`, and both mem and rocksdb default it off. Our tier's refusal of a `version` argument is therefore upstream's own position for a backend registered without versioning, not a gap we invented | PUBAPI | `surrealdb-kvs-mem` 3.3.0 `src/lib.rs` `Datastore::new`; `src/cnf.rs` | 2026-10-04 | recorded |
+| R-0050 | `surrealdb.TablePrefix.v1` extracts the prefix of a *table-level* key, variable-length, ending **at and including** a one-byte discriminator. A key is in the domain iff it is at least 14 bytes, has `/`, `*`, `*`, `*` at offsets 0, 1, 6, 11 (`/`, `*`, a 4-byte namespace id, `*`, a 4-byte database id, `*`), has a `\0` at or after offset 12, and has at least one byte after that `\0`. The prefix is `key[..null_pos + 2]`. Discriminators: `*` records, `+` index entries, `!` table metadata, `~` graph edges, `&` refs. Out-of-domain keys are returned **unchanged** by `Transform` and excluded by `InDomain`, which is what keeps an unrecognised key out of the bloom filter | SRC | `surrealdb-kvs-rocksdb` 3.3.0 `src/prefix_extractor.rs` `parse_prefix_end` / `transform` / `in_domain`, `NAME`, `TB_START`, `MIN_LEN` — format shape only, reimplemented in `crates/surrealdb-ds-server/tests/interop.rs` from the documented layout | 2026-10-04 | recorded, implemented, verified against 55 real keys |
+| R-0051 | **The recorded `prefix_extractor` name is not what admits the open.** `DB::open` does not read the on-disk `OPTIONS` file — the options in force are those passed in code, and the `prefix_extractor` line is consulted only by an explicit `Options::load_from_file`. Measured: the same upstream-written directory opens and reads all 55 keys byte-identically with **no** extractor registered, and with one registered as `wrong.Name.v0`. This **supersedes the premise** the ADR-0008 tranche was briefed on | OBS | `cargo test -p surrealdb-ds-server --test interop the_named_extractor_is_not_what_makes_the_open_succeed`; corroborated by the absence of any `OPTIONS`-load step on the `DB::open` path in `surrealdb-rocksdb` 0.24.0-surreal.5 `src/db.rs` `DB::open` | 2026-10-04 | recorded, verified; **refines ADR-0008** |
+| R-0052 | The extractor's *computation* is nevertheless load-bearing, and a wrong one **fails silently**: under `ReadOptions::set_prefix_same_as_start(true)` the same prefix-restricted seek returns 2 rows with the correct extractor and 12 with a mismatched one or none — a wider answer, never an error. On a full forward scan the mismatch is invisible, so byte-equality against a whole keyspace does **not** validate the extractor | OBS | `cargo test -p surrealdb-ds-server --test interop a_mismatched_extractor_silently_widens_a_prefix_restricted_read`; seek key `/*\0\0\0\0*\0\0\0\0*person\0*\0`, upstream-written directory, 55-key dataset | 2026-10-04 | recorded, verified |
+| R-0053 | A clean shutdown **rewrites the node row**: upstream archives its own `/!nd{nd}` entry on the way out, so `Node.gc` goes `false -> true` and byte 27 of that 29-byte value changes. Measured: 1 of 55 keys differs between a keyspace dumped through a live `Datastore` and the same directory read after `shutdown()`. A harness that dumps through a live writer and then reads the directory is comparing two different moments | OBS | `cargo test -p surrealdb-ds-server --test interop a_clean_shutdown_rewrites_the_node_row`; `surrealdb-catalog` 3.3.0 `src/node.rs` `Node { id, heartbeat, gc, http_endpoint }` — field order, for reading the byte | 2026-10-04 | recorded, verified |
+| R-0054 | The RocksDB binding upstream uses is the SurrealDB-maintained fork `surrealdb-rocksdb` **0.24.0-surreal.5** over `surrealdb-librocksdb-sys` **0.18.3+11.0.0-4** (RocksDB **11.0.0**), requested with features `lz4` + `snappy` only. The public `rocksdb` crate's newest line resolves to `librocksdb-sys` 0.19.0 = RocksDB **11.8.1**, and its 0.24.0 line to 0.17.3 = RocksDB **10.4.2**. `format_version=7` is readable by all three (`kLatestFormatVersion`/`kLatestBbtFormatVersion = 7`, read floor 2), so **format_version does not discriminate between them** | PUBAPI | crates.io sparse index `ro/ck/rocksdb` and `li/br/librocksdb-sys`, read 2026-10-04; `surrealdb-kvs-rocksdb` 3.3.0 `Cargo.toml` `[dependencies.rocksdb]`; `table/format.h` in each tree | 2026-10-04 | recorded, verified |
 
 ---
 
@@ -169,6 +174,58 @@ not read as more than it is:
    `PERMISSIONS` lives. Those bytes *are* compared, absolutely, by the round trip;
    they are simply not in the committed file, because no byte-pinning of a
    value containing a millisecond timestamp survives a day.
+
+---
+
+## Closed by the interop tranche (ADR-0008), and how far
+
+`crates/surrealdb-ds-server/tests/interop.rs` is `make interop`, and it is the
+falsification experiment ADR-0008's own Sequencing section asked for: open a
+directory upstream wrote with `rocksdb` as **our** dependency, register a
+`SliceTransform` named `surrealdb.TablePrefix.v1`, and read the keyspace back byte
+identically. It passed on the first correct attempt — 55 keys, 1526 value bytes,
+every key and every value, read both by our binding and by upstream's own reader
+on the same closed directory.
+
+It also **narrowed** the decision in two places worth more than the pass:
+
+- **R-0051 supersedes the brief's premise.** The recorded `prefix_extractor` name
+  is not what admits the open; `DB::open` never reads the on-disk `OPTIONS` file.
+  The directory opens with no extractor registered, and with one registered under
+  a name upstream never wrote. Anyone budgeting the tier for "reproduce a name
+  RocksDB resolves on open" was budgeting for the wrong thing.
+- **R-0052 replaces it with a sharper obligation.** The extractor's *computation*
+  is load-bearing and a wrong one fails silently rather than loudly, returning a
+  **wider** range than asked for under `prefix_same_as_start`. That obligation is
+  invisible to a whole-keyspace byte comparison, which is why two tests exist that
+  do not compare bytes at all.
+
+And it recorded one upstream behaviour nobody had written down (**R-0053**): a
+clean shutdown archives upstream's own node row, so a keyspace dumped through a
+live `Datastore` is not the keyspace on disk afterwards. The first version of the
+harness compared exactly those two and failed on exactly one byte, reproducibly.
+That is a trap for the tier as much as for the harness.
+
+What it does **not** establish, so that a green run is not read as more than it is:
+
+1. **Nothing about writing.** Every test here reads a directory upstream wrote.
+   The other half of ADR-0008 — a directory *we* wrote that upstream opens — is
+   untested, and it is the half that needs the `OPTIONS` profile reproduced rather
+   than merely satisfied on read.
+2. **No key class is proven complete**, the same limit the golden harness records.
+3. **A 55-key dataset never leaves one level.** Compression, blob files,
+   two-level indexes and partitioned filters are *configured* in the `OPTIONS`
+   file and *exercised* nowhere. `upstream_leaves_sst_files_behind` asserts the one
+   thing that is checked about it — that a real SST is read, not only a WAL — but
+   one SST of one level is not a format.
+4. **The `OPTIONS` file records settings, not behaviour.** It names codecs the
+   linked binding does not compile (`bottommost_compression=kZSTD`, with only
+   `lz4` and `snappy` built), and nothing has ever failed, because the compaction
+   that would have used them never ran. It is a capture of upstream's *defaults
+   plus its overrides*, and it is wrong about at least one thing that matters for
+   writing: `compression_per_level` is `kNoCompression:kLZ4×4:kZSTD×3`, hardcoded
+   upstream, and a writer that does not reproduce it produces files upstream can
+   still read — but not files upstream would have produced.
 
 ---
 

@@ -701,3 +701,194 @@ because it is destructive and it costs machine-time, so it is not done here.
   machine alongside the Alpine one and remove the need to destroy anything.
 - Local disk is reclaimed some other way, which removes the pressure that made
   this urgent.
+
+---
+
+## ADR-0010 — A shared, multi-project Debian build server
+
+**Status:** accepted · **Date:** 2026-10-04 · **Next free: ADR-0011
+
+Supersedes the deployment half of ADR-0009, which reached the right diagnosis
+(builds must be offloaded) by the wrong route (an Alpine box that could not
+build the workspace). ADR-0009's musl finding stands and is why the base changed.
+
+### Context
+
+ADR-0009 got the transport working against a Fly machine but could not finish a
+build, because musl cannot. It also could not fix that in place: the app was a
+registered org build machine, so Fly refused both `machine update --image`
+(*"deploying over the remote builder is not allowed"*) and a second machine
+(*"remote builders may have only one volume"*). Both limits are **app-scoped
+privileges of being a builder**, so the fix was a separate app rather than a
+fight with the builder one.
+
+The workstation still could not build: `target/debug` is 32G against 18G free.
+
+### Decision
+
+A dedicated app, `open-surrealdb-ds-builder`, running `debian:bookworm-slim` on
+`performance-8x` (8 dedicated cores, 16 GB) with a 100 GB volume at `/data`,
+reached over **2PN** only. Debian for parity with upstream's CI images, and
+because glibc is a hard requirement rather than a preference.
+
+Dedicated cores rather than shared: build throughput has to be predictable, and
+`shared-cpu-8x` is noisy-neighbour throttled. It is also not the constraint —
+8 dedicated cores for a few minutes a day is not an expensive thing to own.
+
+**It is a shared server, not a personal builder.** Several projects build on it
+at once, so:
+
+- `/data/cargo` and `/data/rustup` are shared, so the crates.io cache and the
+  toolchain are paid for once across every project.
+- `/data/builds/<hash>` is per project, named by cargo-remote after a hash of the
+  project path, so projects cannot collide and agree on no naming scheme.
+- Compiled artifacts are *not* shared; they stay in each project's `target/`.
+  Sharing them would want sccache, which is a later decision.
+- One build gets `[build] jobs = 4` of 8 cores, so two concurrent projects divide
+  the machine instead of starving. Overridable per invocation with
+  `-b CARGO_BUILD_JOBS=N`.
+- No project-specific state lives on the box. A project contributes a
+  `Makefile` target and nothing else, so a new project needs no provisioning.
+
+The operational reference is the `shared-flyio-build-server` agent skill. The
+machine definitions and provision scripts live in that skill rather than in this
+repository: they describe a shared environment, not this project, and every
+project would otherwise carry a copy that drifts.
+
+### Consequences
+
+- **`-d 1.95.0` is mandatory and has no config-file equivalent.** cargo-remote's
+  toolchain flag defaults to `stable` and it runs `rustup default` on every
+  build, so omitting it silently installs and switches compiler versions. A rustc
+  bump must not be mistakable for a contract change, which is why `ci.yml` pins
+  1.95.0 too.
+- **`env` in a cargo-remote config is a list of files to source, not
+  `KEY=VALUE`.** Setting it to a variable name displaces the default
+  `~/.cargo/env` and every build fails with `cargo: command not found`. Both that
+  and the toolchain flag cost a debugging round and are in the skill.
+- **`debug = 0` remotely.** The same build is 32G locally with debuginfo and
+  about 3.5G on the box. Nothing is debugged on a build server.
+- **Our whole tree fits with room to spare**, so concurrency is a CPU question
+  rather than a disk one.
+- **The lockfile is shared, so resolution is identical.** `sha256sum` of the
+  remote `Cargo.lock` matches the local file, which is the check that matters:
+  what compiles must not depend on where it compiles.
+
+### Revisit if
+
+- A second region or app becomes necessary, at which point per-region pinning
+  matters because 2PN is low-latency only within a region.
+- Build times become painful enough to justify sccache, which would share
+  compiled artifacts across projects as well as sources.
+- The disk pressure that motivated this is relieved some other way, which would
+  remove the reason to keep a build box running at all.
+
+---
+
+## ADR-0011 — On-disk interop works; the prefix extractor fails silently, not loudly
+
+**Status:** accepted · **Date:** 2026-10-04 · **Next free: ADR-0012
+
+Corrects two claims in ADR-0008. Both were mine, both were checked before being
+written down, and both were wrong.
+
+### What ADR-0008 got right
+
+The read half of the decision holds. `tests/interop.rs` opens a directory
+upstream's own engine wrote, using `rocksdb` as *our* dependency, and reads back
+**55 keys / 1526 value bytes byte-identically** — every key and every value, no
+exclusions. `make interop`. So a stock upstream directory is readable by our
+code, which is the property ADR-0008 was reaching for.
+
+### Correction 1 — a missing extractor name is not an open failure
+
+ADR-0008 says of `prefix_extractor=surrealdb.TablePrefix.v1`: *"RocksDB resolves
+it by name when opening. An extractor that is not registered under that exact
+name is an **open failure**, not a warning."*
+
+**It is not.** `DB::open` never reads the on-disk `OPTIONS` file at all. The
+directory opens with no extractor registered, and equally with one registered
+under a deliberately wrong name. Both of those are asserted as tests, precisely
+because the premise was load-bearing and false (R-0051).
+
+The name in `OPTIONS` is inert. It does not have to be reproduced for the open to
+succeed.
+
+### Correction 2 — the real failure mode is worse than an error
+
+A wrong extractor does not fail. It **silently widens** the read. A
+prefix-restricted seek returns the entire run instead of the narrowed range, and
+the caller cannot tell:
+
+```
+2 rows with our extractor, 24 with a mismatched one, 24 with none — wider, not an error
+```
+
+This is the exact hazard class this project's other risks live in: a subtly wrong
+rule producing **silently wrong data rather than an error**. It is worse than the
+open failure ADR-0008 predicted, because it will not announce itself.
+
+### Correction 3 — byte equality does not validate the extractor
+
+A methodological finding worth more than either correction. Injecting an
+off-by-one into our extractor left the headline byte-equality test **green**.
+Reading a whole keyspace and comparing it byte-for-byte cannot tell a correct
+prefix extractor from a slightly-short one, because a too-short prefix reads
+*more* rows and the comparison still matches. The extractor therefore needs its
+own assertions about narrowed ranges, which is what
+`a_mismatched_extractor_silently_widens_a_prefix_restricted_read` exists for.
+
+### What `TablePrefix.v1` actually is
+
+Variable-length, ending at and including a one-byte discriminator. In domain iff
+the key is ≥14 bytes, `key[0,1,6,11]` are `/ * * *`, there is a `\0` at offset
+≥12, and at least one byte follows it. The prefix is `key[..null_pos + 2]`.
+`*` records, `+` index entries, `!` metadata, `~` edges, `&` references. Keys
+outside the domain are returned unchanged and excluded by `InDomain`. 39 of our
+55 keys are in domain. Source: `surrealdb-kvs-rocksdb` `src/prefix_extractor.rs`
+(`TB_START`, `MIN_LEN`, `parse_prefix_end`) — `SRC`, format shape,
+reimplemented from the documented layout.
+
+### The binding was a cost decision, not a necessity
+
+ADR-0010 implied the fork was required. It is not. `format_version = 7` does not
+discriminate: `kLatestBbtFormatVersion` is 7 in RocksDB 11.0.0, 11.8.1 and 10.4.2,
+with a read floor of 2 in all three. The public `rocksdb` crate could read these
+files.
+
+We use `surrealdb-rocksdb` 0.24.0-surreal.5 (wrapping RocksDB 11.0.0) because it
+is **already in our `Cargo.lock`**, so it cost one edge in the lockfile and zero
+rebuild, against a full C++ rebuild of a different RocksDB version. That is a
+cost judgement and it is recorded as one, with the alternative named. Features
+are pinned to `lz4` and `snappy` because taking defaults adds zstd, zlib,
+bzip2 and bindgen and forces that recompile.
+
+It is a SurrealDB-maintained fork, so `NOTICE` gained a fourth licensing path
+rather than letting a crate that is neither vendored nor ours-by-name pass
+unremarked.
+
+### What is still unproven
+
+- **Writing.** ADR-0008's other half: a directory *we* wrote, opened by upstream.
+  Nothing has been written in our own format yet.
+- **Key-class completeness**, as ever.
+- **Anything past one L0 SST.** Compression, blob files, two-level indexes and
+  partitioned filters are all configured in the `OPTIONS` file and none has been
+  exercised. `bottommost_compression = kZSTD` in particular is never reached,
+  because upstream links only lz4 and snappy — the `OPTIONS` file records
+  defaults, not behaviour.
+- **Bloom-filter correctness at scale**, and the Rust API's stability.
+
+One upstream behaviour worth recording because it cost a debugging round and
+would have looked like corruption: **a clean shutdown rewrites its own `/!nd`
+row** (R-0053). Comparing a pre-shutdown dump against a closed directory fails on
+that byte, reproducibly.
+
+### Revisit if
+
+- A durable tier writes its own database and upstream opens it — the write half,
+  and the only thing that would settle ADR-0008 completely.
+- The public `rocksdb` crate becomes preferable, which the version data says it
+  already is on capability grounds.
+- A key class outside this workload fails to round-trip, which would mean the
+  keyspace is not the closed set `keyspace.map` claims.

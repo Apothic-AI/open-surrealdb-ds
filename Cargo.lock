@@ -6171,6 +6171,7 @@ dependencies = [
  "surrealdb-kvs",
  "surrealdb-kvs-any",
  "surrealdb-observe",
+ "surrealdb-rocksdb",
  "surrealdb-server",
  "tokio",
  "tokio-util",

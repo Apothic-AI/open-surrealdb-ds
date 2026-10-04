@@ -32,3 +32,18 @@ tracing-subscriber = "0.3"
 # The golden-file harness names `RawRange`, `AnyRange` and `TransactionType`,
 # which live in the `Transactable` contract crate the engine already links.
 surrealdb-kvs = "3.3.0"
+
+# The RocksDB binding upstream itself uses, so `tests/interop.rs` can open a
+# directory upstream wrote with *our* code rather than with theirs. This is the
+# SurrealDB-maintained fork (`surrealdb-rocksdb`, wrapping RocksDB 11.0.0), not
+# the public `rocksdb` crate — see ADR-0008 and PROVENANCE.md R-0050/R-0051.
+#
+# `default-features = false` with the feature set pinned to exactly what
+# `surrealdb-kvs-rocksdb` already asks for is load-bearing, not tidiness. Cargo
+# unions features per package across the whole graph, so taking this crate's
+# defaults would additionally enable `zstd`, `zlib`, `bzip2` and
+# `bindgen-runtime`, which changes `surrealdb-librocksdb-sys`'s own feature set
+# and forces a full recompile of the bundled RocksDB C++ — several minutes of
+# build for codecs this harness never asks for. Pinned to the same set, the
+# already-compiled artifact is reused.
+surrealdb-rocksdb = { version = "0.24.0-surreal.5", default-features = false, features = ["lz4", "snappy"] }

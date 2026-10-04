@@ -16,40 +16,39 @@ Read, in order: `README.md`, `PROGRESS.md` (newest first — **verified vs
 intended**), `DECISIONS.md`, `PLAN.md`, `PROVENANCE.md`, `NOTICE`,
 `docs/architecture.md`, and `docs/remote-builds.md`.
 
-## Build on the Fly machine, not locally
+Load the `shared-flyio-build-server` skill before using the build server; it is
+the operational reference and carries the traps.
 
-**The local disk is full.** `target/debug` alone is ~32G against ~18G free.
-Building locally will fail or evict things you did not mean to touch.
+## Build on the shared Fly server, not locally
+
+**The local disk is full.** `target/debug` alone is ~32G against ~18G free, so
+local building is impossible rather than merely slow.
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
 
-cargo remote-3000 -r fly check  --workspace --all-targets
-cargo remote-3000 -r fly clippy --workspace --all-targets -- --deny warnings
-cargo remote-3000 -r fly test   --workspace
+cargo remote-3000 -r fly -d 1.95.0 check  --workspace --all-targets
+cargo remote-3000 -r fly -d 1.95.0 clippy --workspace --all-targets -- --deny warnings
+cargo remote-3000 -r fly -d 1.95.0 test   --workspace
 ```
 
-Nothing is copied back unless you pass `--copy-back`, so these return only
-output. To fetch one binary (e.g. for `make smoke`):
+Nothing comes back unless you pass `--copy-back`, so these return only output.
+For the server binary that `make smoke` needs:
 
 ```bash
-cargo remote-3000 -r fly build -c=debug/surrealdb-ds-server -p surrealdb-ds-server
+cargo remote-3000 -r fly -d 1.95.0 build -c=debug/surrealdb-ds-server -p surrealdb-ds-server
 ```
 
-**Read `docs/remote-builds.md` before relying on this.** As of the last
-commit the transport, toolchain and most of the dependency graph work, but the
-build does not complete on the current Alpine machine, because bindgen needs
-libclang linkable and musl cannot provide it. If a remote build fails, check
-whether it failed for that reason or a new one before assuming the setup is
-broken.
+**`-d 1.95.0` is not optional** — cargo-remote defaults the toolchain to
+`stable` and runs `rustup default` on every build, so omitting it silently
+installs and switches compiler versions.
 
-If the machine is stopped, `flyctl machine start` and then
-`flyctl machine exec ... /data/bin/ensure-ready` — its root filesystem is
-ephemeral, so packages must be reinstalled after every restart.
+The box is stopped when idle, so start it first (see the skill). Its root
+filesystem is ephemeral, so packages must be reinstalled after every restart.
 
 Local `cargo` still works and is the fallback when the machine is unavailable.
-If you must build locally, do not run `cargo clean` casually: it is 32G you may
-need back.
+`make check` and `make test` are what CI runs. If you must build locally, do not
+run `cargo clean` casually: it is 32G you may need back.
 
 ## Verify before you claim
 
