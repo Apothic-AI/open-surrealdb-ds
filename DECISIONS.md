@@ -507,7 +507,11 @@ left to the reader:
 
 ## ADR-0008 — The durable tier targets full on-disk interchangeability with upstream
 
-**Status:** accepted · **Date:** 2026-10-04 · **Next free: ADR-0009**
+**Status:** accepted, **amended by ADR-0012** — the decision below stands as a
+compatibility target, but "the durable tier's primary architectural constraint" is
+**withdrawn**, and the claim that a stock-readable directory is the strongest
+evidence of semantic equivalence was **overstated**. Read ADR-0012 before acting
+on this record. · **Date:** 2026-10-04 · **Next free: ADR-0009**
 
 ### Context
 
@@ -892,3 +896,138 @@ that byte, reproducibly.
   already is on capability grounds.
 - A key class outside this workload fails to round-trip, which would mean the
   keyspace is not the closed set `keyspace.map` claims.
+
+---
+
+## ADR-0012 — Amend ADR-0008: a stock-readable directory is a profile, not the architecture
+
+**Status:** accepted · **Date:** 2026-10-04 · **Next free: ADR-0013
+
+Amends ADR-0008. Taken after a second opinion, and it corrects the reasoning in
+my own record rather than only adding to it.
+
+### What I got wrong
+
+ADR-0008 offered two arguments for making full on-disk interchangeability the
+durable tier's primary constraint. The disaster-recovery one holds. The second
+one does not, and it was the load-bearing one:
+
+> "It is the strongest available evidence that our understanding of the system is
+> correct."
+
+A stock-readable directory is **not** evidence that our transaction semantics
+match. It shows that key/value bytes are represented compatibly, that RocksDB can
+parse the files, and that upstream's reader can enumerate the materialised
+keyspace. It says nothing about read validation, commit ordering, global
+timestamps, recovery, `safe_timestamp`, indeterminate commits, or quorum
+behaviour. **A semantically wrong distributed engine can still write a perfectly
+readable RocksDB directory.** The evidence is real but much weaker than claimed,
+and building an architecture around it optimises the wrong thing.
+
+### The decision
+
+> The durable tier must support a **tested, versioned stock-upstream-readable
+> export profile**. The distributed engine's canonical durability and recovery
+> format is **independent** of that profile.
+
+The commit log and recovery records are canonical; RocksDB is a durable local
+materialisation; a quiesced logical snapshot exports the KV state needed to
+reconstruct it, with a manifest carrying upstream version, profile, epoch, counts
+and hashes; and an optional exporter writes a stock-readable directory. The cost
+is that we own an explicit export/import path instead of getting one-command
+recovery for free. That is cheaper than making a third-party local file format
+the foundation of the engine, and it stops every upstream upgrade becoming a
+storage-format compatibility event.
+
+### Architecture: one transaction-semantic layer, two stores
+
+The largest risk in implementing `Transactable` over RocksDB is **treating a
+locally atomic RocksDB transaction as the distributed commit protocol.** Our
+in-memory tier validates and applies under one lock (`storage.rs::commit` takes
+`inner = self.lock()` and validates the read set under it), so once validation
+succeeds nothing can interpose. A durable tier has at least four separately
+reorderable events: read at a distributed snapshot, validate and assign commit
+identity, durably record the commit, and apply-and-publish locally. Crashes,
+retries, replication lag and view change reorder them. **A local RocksDB sequence
+number is not a distributed commit timestamp**, and a RocksDB snapshot is local
+state, not a cluster-wide snapshot.
+
+One consequence is already concrete and would have bitten us: **RocksDB's own
+write-write conflict detection would reject overlapping blind writes**, which is
+exactly what the `surrealds` contract requires to *all commit* in stamp order
+(ADR-0006, and `multiwriter_same_keys_allow` in the conformance suite). Using
+RocksDB's transaction API naively fails conformance for the right-looking reason.
+
+So the shape is:
+
+- **one transaction-semantic layer** — lifecycle, staged writes, read sets,
+  savepoints, cursors, error mapping;
+- **a small storage interface** beneath it;
+- the current in-memory store as one implementation, kept as an **executable
+  reference model**;
+- RocksDB as a second implementation; and later, the distributed
+  log/materialisation layer supplying global stamps and commit outcomes.
+
+Both stores then run the **same generated operation traces and conflict
+schedules** — point reads, scans, ranges, tombstones, savepoints, cursor
+continuation, blind overlapping writes, write skew, dropped transactions, reopen,
+injected crash points. The point is to stop the durable tier quietly redefining
+the contract because RocksDB's native transaction API has different defaults.
+
+### Write without a prefix extractor first
+
+ADR-0011 established that a wrong prefix extractor **silently widens** reads, and
+that byte equality cannot detect it. There is a way to sidestep the hazard
+entirely at first: write with **no** prefix extractor, use explicit lower/upper
+key bounds, and do not enable `prefix_same_as_start`. That gives up
+prefix-bloom and prefix-seek optimisation and buys correctness by construction —
+we cannot build filters under a rule we have got wrong. A stock upstream reader
+can still open such a directory.
+
+`TablePrefix.v1` is deferred to a later optimisation or exact-options
+compatibility feature, and **the range assertions stay permanently** if it is ever
+added. Do not register a guessed extractor merely because its name matches.
+
+### Sequencing
+
+The original plan — "upstream opens a directory we wrote" as the durable tier's
+*first milestone* — is right about forcing format questions early and wrong about
+it being the milestone. It is a one-day spike, not an architecture:
+
+1. **Format probe.** Write a tiny representative keyspace through the binding,
+   no prefix extractor, flush and close. Open it with upstream's reader, read
+   bounded ranges, mutate, close, reopen with ours. Falsifiable and small.
+2. **Restart-safe local persistence.** Create/open/reopen, atomic write batches,
+   tombstones, WAL recovery, and behaviour after a crash at each commit boundary.
+3. **Differential transaction semantics.** The existing coordinator over the
+   RocksDB storage implementation, traces compared against the in-memory reference.
+4. **Durable commit identity and recovery.** Idempotent apply, commit-log
+   reconciliation, indeterminate outcomes, explicit visibility rules.
+5. **Distributed timestamps and quorum.** Only now connect global commit stamps,
+   safe watermarks, replication, recovery drain.
+6. **Stock-directory compatibility profile.** Exact extractor behaviour, option
+   tuning, compaction and blob coverage, upstream-openability as a separately
+   versioned acceptance target.
+
+Crash recovery and commit semantics come before on-disk compatibility, because
+they are what a distributed engine is actually for, and a readable directory does
+not evidence any of it.
+
+### Consequences
+
+- **Step 1 is the next piece of work** and is deliberately small.
+- **The conformance suite gains a role**: it is already an executable contract, so
+  a RocksDB-backed store that passes it is evidence the durable tier did not
+  redefine the contract. That is stronger evidence than a readable directory.
+- **ADR-0008's captured `OPTIONS` evidence stays useful** — as the spec for the
+  export profile in step 6.
+- **`safe_timestamp` remains unimplemented-as-correct** (R-0010) and is step 5,
+  not this one.
+
+### Revisit if
+
+- An operational runbook genuinely requires handing a node's directory to a stock
+  `surreal`, which would promote the export profile from optional to mandatory.
+- Upstream's on-disk format is itself versioned and supported across releases,
+  which would make matching it cheaper than it looks.
+- The export profile turns out to need state the logical snapshot cannot carry.
