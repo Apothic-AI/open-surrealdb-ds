@@ -52,12 +52,32 @@
 //! and [`a_mismatched_extractor_silently_widens_a_prefix_restricted_read`] shows
 //! what happens when one does not.
 //!
+//! # The write direction (ADR-0012 step 1)
+//!
+//! Everything above reads a directory upstream wrote. ADR-0011 left the write
+//! half unproven — "a directory *we* wrote, opened by upstream" — and ADR-0012
+//! step 1 asks for the smallest falsifiable version of it rather than a durable
+//! tier: write a tiny representative keyspace through `rocksdb` as *our*
+//! dependency, **with no prefix extractor**, flush one SST, close, and hand the
+//! directory to upstream's reader.
+//!
+//! The bounded ranges are the point, not the open. ADR-0011 showed a wrong
+//! prefix extractor **silently widens** a prefix-restricted read and that byte
+//! equality cannot see it. So the writer here installs no extractor at all and
+//! reads only under explicit lower/upper bounds (ADR-0012's
+//! correctness-by-construction rule). Upstream's reader, however, *does* install
+//! `TablePrefix.v1` on open and enables `prefix_same_as_start` whenever both scan
+//! bounds are in-domain and share an extracted prefix — so the range assertions
+//! below exercise exactly the path a missing or wrong filter would corrupt.
+//!
 //! # What this does NOT prove
 //!
 //! Stated here so a green run is not read as more than it is:
 //!
-//! 1. **Nothing about writing.** We read a directory; we never write one that
-//!    upstream opens. That is the other half of ADR-0008 and it is untested.
+//! 1. **The write direction is a one-SST spike, not a tier.** It writes raw
+//!    RocksDB with no `OPTIONS` profile, no WAL recovery, no commit semantics;
+//!    ADR-0012 steps 2–6 are the tier. It shows a reader can open what we write,
+//!    not that our engine is equivalent.
 //! 2. **Only the key classes this dataset reaches.** No class is proven
 //!    complete — the same limit the golden harness records.
 //! 3. **A small dataset.** 55 keys never leave one level, so compression, blob
@@ -80,7 +100,8 @@ mod common;
 use std::path::Path;
 
 use common::{Backend, Keyspace, Scratch, author_with_surrealql, hex, show};
-use rocksdb::{DB, Direction, IteratorMode, Options, ReadOptions, SliceTransform};
+use rocksdb::{DB, Direction, IteratorMode, Options, ReadOptions, SliceTransform, WriteBatch};
+use surrealdb_kvs::{Key, TransactionType};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // `surrealdb.TablePrefix.v1`
@@ -541,6 +562,310 @@ async fn the_comparison_catches_a_flipped_bit() -> anyhow::Result<()> {
 	);
 	println!(
 		"falsify: one flipped bit caught at byte {at} of {}, the last byte of the largest value in the dataset\n{}",
+		victim_val.len(),
+		message
+	);
+	Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ADR-0012 step 1: the write direction
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The 12-byte prefix shared by every table-level key in this probe:
+/// `/`, `*`, a 4-byte namespace id, `*`, a 4-byte database id, `*`.
+const HEADER: &[u8] = b"/*\x00\x00\x00\x01*\x00\x00\x00\x01*";
+
+/// A key under [`HEADER`], built at runtime because a `const` cannot concatenate.
+fn key(suffix: &[u8]) -> Vec<u8> {
+	[HEADER, suffix].concat()
+}
+
+/// What our writer put in the directory, so the reader can be held to it.
+struct Written {
+	/// The live keyspace a full scan must return. The tombstoned key is not here.
+	live: Keyspace,
+	/// Keys written and then deleted, so the directory carries real tombstones.
+	tombstoned: Vec<Vec<u8>>,
+}
+
+/// Write the probe keyspace through `rocksdb` as **our** dependency.
+///
+/// No prefix extractor is installed anywhere in this function, and that is the
+/// probe's central choice: with no extractor there is no filter to build under a
+/// rule we might have got wrong (ADR-0011, ADR-0012). The one column family is
+/// RocksDB's default, which is the only one upstream uses.
+///
+/// The keys span the shapes the golden manifest reaches — a record, an index
+/// entry, table metadata, a graph edge, an edge document, and a root-level
+/// namespace row — so upstream's own prefix extractor has both in-domain and
+/// out-of-domain keys to classify when it opens the file.
+///
+/// A record is written, flushed, then deleted and flushed again, so the SSTs
+/// carry a genuine tombstone over a value rather than an absent key. A reader
+/// cannot see the tombstone itself, only its net effect, which is what is
+/// asserted.
+fn write_our_directory(dir: &Path) -> anyhow::Result<Written> {
+	let mut opts = Options::default();
+	opts.create_if_missing(true);
+	let db = DB::open(&opts, dir)?;
+
+	let pairs: Vec<(Vec<u8>, Vec<u8>)> = vec![
+		(b"/!ns\x00\x00\x00\x01".to_vec(), b"namespace-metadata".to_vec()),
+		(key(b"person\x00*\x03one\x00"), b"record-one-value".to_vec()),
+		(key(b"person\x00*\x03two\x00"), b"record-two-value".to_vec()),
+		(key(b"person\x00+one@example.com\x00"), b"index-entry-value".to_vec()),
+		(key(b"person\x00!fdname\x00"), b"field-definition-value".to_vec()),
+		(key(b"person\x00~\x03one\x00"), Vec::new()),
+		(key(b"knows\x00*\x08edge_one\x00"), b"edge-document-value".to_vec()),
+	];
+
+	let mut live = Keyspace::new();
+	let mut batch = WriteBatch::default();
+	for (key, val) in &pairs {
+		batch.put(key, val);
+		live.insert(key.clone(), val.clone());
+	}
+	let victim = key(b"person\x00*\x05three\x00");
+	batch.put(&victim, b"record-three-value");
+	db.write(batch)?;
+	db.flush()?;
+
+	// The delete lands in a second SST, over a value already in the first.
+	let mut batch = WriteBatch::default();
+	batch.delete(&victim);
+	db.write(batch)?;
+	db.flush()?;
+	drop(db);
+
+	Ok(Written { live, tombstoned: vec![victim] })
+}
+
+/// The format-relevant lines of the `OPTIONS` file our writer produced.
+///
+/// Upstream's `OPTIONS` records `prefix_extractor=surrealdb.TablePrefix.v1` and
+/// `index_type=kTwoLevelIndexSearch` with `partition_filters=true`; ours, written
+/// from default options, should record none of that. The recorded file is inert
+/// on open (R-0051), so printing it is how step 6 sees which settings are a
+/// profile difference and which are merely absent.
+fn our_format_relevant_options(dir: &Path) -> Vec<String> {
+	let Ok(entries) = std::fs::read_dir(dir) else {
+		return Vec::new();
+	};
+	let Some(path) = entries.flatten().map(|entry| entry.path()).find(|path| {
+		path.file_name().is_some_and(|name| name.to_string_lossy().starts_with("OPTIONS"))
+	}) else {
+		return Vec::new();
+	};
+	let Ok(text) = std::fs::read_to_string(&path) else {
+		return Vec::new();
+	};
+	const KEYS: [&str; 7] =
+		["prefix_extractor", "comparator", "format_version", "compression", "index_type", "partition_filters", "checksum"];
+	text.lines().filter(|line| KEYS.iter().any(|key| line.contains(key))).map(str::trim).map(str::to_owned).collect()
+}
+
+/// Append one byte to a prefix, to build an explicit lower or upper bound.
+fn end_of(prefix: &[u8], last: u8) -> Vec<u8> {
+	let mut out = prefix.to_vec();
+	out.push(last);
+	out
+}
+
+/// The bounded ranges the probe checks, spanning both prefix modes upstream can
+/// choose: in-domain same-prefix bounds (`prefix_same_as_start`) and bounds that
+/// differ or fall outside the domain (`total_order_seek`).
+fn probe_ranges() -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
+	let records = key(b"person\x00*");
+	let indexes = key(b"person\x00+");
+	let metadata = key(b"person\x00!");
+	let edges = key(b"person\x00~");
+	let edge_docs = key(b"knows\x00*");
+	vec![
+		("person records", end_of(&records, 0x00), end_of(&records, 0xff)),
+		("person index", indexes.clone(), end_of(&indexes, 0xff)),
+		("person metadata", metadata.clone(), end_of(&metadata, 0xff)),
+		("person edges", edges.clone(), end_of(&edges, 0xff)),
+		("edge table records", end_of(&edge_docs, 0x00), end_of(&edge_docs, 0xff)),
+		("cross-category", end_of(&metadata, 0x00), end_of(&edges, 0xff)),
+		("root metadata", b"/!".to_vec(), b"/!z".to_vec()),
+	]
+}
+
+/// One bounded range through **our** reader, no prefix extractor, explicit
+/// lower/upper bounds, checksums forced.
+fn read_range_with_our_reader(dir: &Path, start: &[u8], end: &[u8]) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+	let opts = Options::default();
+	let db = DB::open(&opts, dir)?;
+	let mut read_opts = ReadOptions::default();
+	read_opts.set_verify_checksums(true);
+	read_opts.set_iterate_lower_bound(start.to_vec());
+	read_opts.set_iterate_upper_bound(end.to_vec());
+
+	let mut out = Vec::new();
+	for item in db.iterator_opt(IteratorMode::From(start, Direction::Forward), read_opts) {
+		let (key, val) = item?;
+		out.push((key.to_vec(), val.to_vec()));
+	}
+	Ok(out)
+}
+
+/// The same bounded ranges through **upstream's** reader, which installs its own
+/// `TablePrefix.v1` extractor on open. One backend handle for every range, then
+/// shutdown: RocksDB holds an exclusive lock, so opens are sequential.
+async fn upstream_bounded_reads(
+	dir: &Path,
+	ranges: &[(&str, Vec<u8>, Vec<u8>)],
+) -> anyhow::Result<Vec<(String, Vec<(Vec<u8>, Vec<u8>)>)>> {
+	let backend = Backend::open(&format!("rocksdb:{}", dir.display())).await?;
+	let mut out = Vec::new();
+	for (label, start, end) in ranges {
+		out.push(((*label).to_owned(), backend.scan(&common::bytes(start, end)).await?));
+	}
+	backend.shutdown().await?;
+	Ok(out)
+}
+
+/// A point read of one key through upstream's reader.
+async fn point_read_with_upstream(dir: &Path, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+	let backend = Backend::open(&format!("rocksdb:{}", dir.display())).await?;
+	let txn = backend.txn(TransactionType::Read).await?;
+	let got = txn.get(Key::from(key), None).await?;
+	txn.cancel().await?;
+	backend.shutdown().await?;
+	Ok(got)
+}
+
+/// Write one key and delete another through upstream's reader, then close.
+async fn mutate_through_upstream(dir: &Path, set: (&[u8], &[u8]), del: &[u8]) -> anyhow::Result<()> {
+	let backend = Backend::open(&format!("rocksdb:{}", dir.display())).await?;
+	let txn = backend.txn(TransactionType::Write).await?;
+	txn.set(Key::from(set.0), set.1.to_vec()).await?;
+	txn.del(Key::from(del)).await?;
+	txn.commit().await?;
+	drop(txn);
+	backend.shutdown().await?;
+	Ok(())
+}
+
+/// ADR-0012 step 1: a directory we write, read by upstream, bounded ranges and
+/// all, round-tripped through an upstream mutation.
+///
+/// The sequence is deliberately one test rather than several: RocksDB holds an
+/// exclusive lock on its directory, so the writer, upstream's reader, and our
+/// reader can only touch it one at a time, and the round trip is a single
+/// sequential story.
+#[tokio::test(flavor = "multi_thread")]
+async fn we_write_a_directory_upstream_can_open_and_read() -> anyhow::Result<()> {
+	let scratch = Scratch::new("write")?;
+	let dir = scratch.dir("ours");
+
+	// 1. Write with our binding, no prefix extractor, and close.
+	let written = write_our_directory(&dir)?;
+	let ssts = count_ext(&dir, "sst");
+	assert!(ssts > 0, "our writer produced no SST, so upstream would only be replaying a write-ahead log");
+	println!(
+		"write: {} live keys / {} value bytes, {} tombstone(s), no prefix extractor, {ssts} .sst file(s)\n  \
+		 upstream's own OPTIONS file names a prefix extractor; ours names none, deliberately",
+		written.live.len(),
+		written.live.values().map(Vec::len).sum::<usize>(),
+		written.tombstoned.len(),
+	);
+	for line in our_format_relevant_options(&dir) {
+		println!("options: {line}");
+	}
+
+	// 2. Upstream opens it and reads the whole keyspace.
+	let upstream = read_with_upstreams_reader(&dir).await?;
+	compare("our directory read by upstream's reader", &written.live, &upstream)?;
+	assert!(!upstream.contains_key(&written.tombstoned[0]), "the tombstoned key came back");
+	println!("read: upstream opened our file and read all {} keys byte-identically", upstream.len());
+
+	// The one that matters: bounded ranges. Expected rows are the bounded slice
+	// of the full read, so a widened range is a mismatch, not a different but
+	// plausible number.
+	let ranges = probe_ranges();
+	let theirs = upstream_bounded_reads(&dir, &ranges).await?;
+	for ((label, start, end), (got_label, got)) in ranges.iter().zip(theirs.iter()) {
+		assert_eq!(label, got_label);
+		let expected: Vec<(Vec<u8>, Vec<u8>)> =
+			upstream.range(start.clone()..end.clone()).map(|(k, v)| (k.clone(), v.clone())).collect();
+		assert!(!expected.is_empty(), "bounded range `{label}` selects no rows, so it proves nothing");
+		assert_eq!(got, &expected, "bounded range `{label}` through upstream's reader returned the wrong rows");
+		println!("range: {label:20} {:>2} rows, exactly the bounded slice of the full read", got.len());
+	}
+
+	// The same ranges through our own reader, under explicit bounds.
+	for (label, start, end) in &ranges {
+		let expected: Vec<(Vec<u8>, Vec<u8>)> =
+			upstream.range(start.clone()..end.clone()).map(|(k, v)| (k.clone(), v.clone())).collect();
+		let ours = read_range_with_our_reader(&dir, start, end)?;
+		assert_eq!(ours, expected, "bounded range `{label}` through our own reader returned the wrong rows");
+	}
+
+	// A point read of a single key, and of the tombstoned one.
+	let one = point_read_with_upstream(&dir, &key(b"person\x00*\x03one\x00")).await?;
+	assert_eq!(
+		one.as_deref(),
+		Some(b"record-one-value".as_slice()),
+		"the point read of a single key returned the wrong value"
+	);
+	let gone = point_read_with_upstream(&dir, &written.tombstoned[0]).await?;
+	assert_eq!(gone, None, "the point read of the tombstoned key returned a value");
+	println!("point: one key returns its value; the tombstoned key reads as absent");
+
+	// 3. Mutate through upstream: one write, one delete, then close.
+	let two = key(b"person\x00*\x03two\x00");
+	let new = key(b"person\x00*\x03new\x00");
+	mutate_through_upstream(&dir, (&new, b"record-new-value"), &two).await?;
+
+	// 4. Reopen with our reader and hold it to the net effect.
+	let mut net = written.live.clone();
+	net.remove(&two);
+	net.insert(new, b"record-new-value".to_vec());
+	let ours_after = read_with_our_reader(&dir, None)?;
+	compare("net effect after upstream mutation, read by our reader", &net, &ours_after)?;
+
+	// 5. Reopen with upstream again, after the round trip.
+	let upstream_after = read_with_upstreams_reader(&dir).await?;
+	compare("net effect after upstream mutation, read by upstream again", &net, &upstream_after)?;
+	println!("round trip: upstream wrote and deleted through our file; both readers agree on the net effect");
+	Ok(())
+}
+
+/// Falsifiability for the write probe: the comparison can reject a bad byte.
+///
+/// A comparison that cannot fail proves nothing, so this flips one bit in what
+/// upstream's reader hands back and requires the same `compare` the probe uses
+/// to notice and name the byte. The same discipline the read half applies, moved
+/// to a directory *we* wrote.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_write_probe_comparison_catches_a_flipped_bit() -> anyhow::Result<()> {
+	let scratch = Scratch::new("write-falsify")?;
+	let dir = scratch.dir("ours");
+	let written = write_our_directory(&dir)?;
+	let upstream = read_with_upstreams_reader(&dir).await?;
+	compare("unmodified written directory, which must pass", &written.live, &upstream)?;
+
+	let (victim_key, victim_val) =
+		upstream.iter().max_by_key(|(_, val)| val.len()).ok_or_else(|| anyhow::anyhow!("written dataset has no values"))?;
+	let at = victim_val.len() - 1;
+	let expected_byte = victim_val[at];
+
+	let mut corrupted = upstream.clone();
+	let got = corrupted.get_mut(victim_key).expect("key was just read");
+	got[at] ^= 0b0000_0001;
+
+	let err = compare("deliberately corrupted read of a directory we wrote", &written.live, &corrupted)
+		.expect_err("the comparison accepted a value with one bit flipped");
+	let message = err.to_string();
+	assert!(message.contains(&format!("first differs at byte {at}")), "the comparison did not name the byte it caught:\n{message}");
+	assert!(
+		message.contains(&hex(&[expected_byte])) && message.contains(&hex(&[expected_byte ^ 0b0000_0001])),
+		"the comparison did not name both bytes:\n{message}"
+	);
+	println!(
+		"falsify: one flipped bit caught at byte {at} of {}, the last byte of the largest value in the written dataset\n{}",
 		victim_val.len(),
 		message
 	);

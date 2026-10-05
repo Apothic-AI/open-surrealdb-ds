@@ -27,21 +27,29 @@ local building is impossible rather than merely slow.
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
 
-cargo remote-3000 -r fly -d 1.95.0 check  --workspace --all-targets
-cargo remote-3000 -r fly -d 1.95.0 clippy --workspace --all-targets -- --deny warnings
-cargo remote-3000 -r fly -d 1.95.0 test   --workspace
+cargo remote-3000 -r fly -d 1.95.0 -- check  --workspace --all-targets
+cargo remote-3000 -r fly -d 1.95.0 -- clippy --workspace --all-targets -- --deny warnings
+cargo remote-3000 -r fly -d 1.95.0 -- test   --workspace
 ```
 
 Nothing comes back unless you pass `--copy-back`, so these return only output.
 For the server binary that `make smoke` needs:
 
 ```bash
-cargo remote-3000 -r fly -d 1.95.0 build -c=debug/surrealdb-ds-server -p surrealdb-ds-server
+cargo remote-3000 -r fly -d 1.95.0 -- build -c=debug/surrealdb-ds-server -p surrealdb-ds-server
 ```
 
-**`-d 1.95.0` is not optional** — cargo-remote defaults the toolchain to
-`stable` and runs `rustup default` on every build, so omitting it silently
-installs and switches compiler versions.
+**Two things are not optional.**
+
+**`-d 1.95.0`** — cargo-remote defaults the toolchain to `stable` and runs
+`rustup default` on every build, so omitting it silently installs and switches
+compiler versions.
+
+**`--` before the cargo arguments** — cargo-remote parses its own flags *after*
+the cargo subcommand too, and `-p` is its `--ssh-port`. So
+`... test -p surrealdb-ds-server` dies with `invalid value
+'surrealdb-ds-server' for '--ssh-port <PORT>'`. The `--` terminator is what keeps
+cargo's `-p` away from cargo-remote's.
 
 The box is stopped when idle, so start it first (see the skill). Its root
 filesystem is ephemeral, so packages must be reinstalled after every restart.

@@ -8,6 +8,98 @@ Status legend: `[x]` done and verified · `[~]` in progress · `[ ]` not started
 
 ---
 
+## 2026-10-05 — ADR-0012 step 1: a directory we write is one upstream can open and read correctly
+
+The **write** half of on-disk interop now works, as a deliberately small probe.
+`crates/surrealdb-ds-server/tests/interop.rs` gains a write direction: our own
+`rocksdb` binding authors a directory, upstream's reader opens it, and a
+round trip through it is byte-faithful. `make interop` is now **9 tests**.
+
+```
+write: 7 live keys / 108 value bytes, 1 tombstone(s), no prefix extractor, 2 .sst file(s)
+options: prefix_extractor=nullptr
+read:  upstream opened our file and read all 7 keys byte-identically
+range: person records 2, person index 1, person metadata 1, person edges 1,
+       edge table records 1, cross-category 5, root metadata 1
+       — each exactly the bounded slice of the full read
+point: one key returns its value; the tombstoned key reads as absent
+round trip: upstream wrote and deleted through our file; both readers agree on the net effect
+```
+
+**The right rows came back, which is the result. The successful open is not.**
+
+### No prefix extractor, and it worked
+
+ADR-0012 decided to write with **no** prefix extractor, using explicit key bounds,
+because a wrong one silently widens reads and byte equality cannot detect it. That
+prediction held: our `OPTIONS` records `prefix_extractor=nullptr`, every setting
+in it differs from upstream's profile, and **every one of those differences was
+inert** for openability and read correctness at this scale. `OPTIONS` is not
+consulted on open at all (ADR-0011), so none of its recorded settings is required.
+
+Upstream still installs `TablePrefix.v1` on *its* side and chose
+`prefix_same_as_start` for itself on the in-domain same-prefix record range. So
+the probe cannot avoid exercising that path — which is what makes the range
+assertion the meaningful one rather than a formality.
+
+### Minimum required, for step 6 to build on
+
+One column family (`default`, no on-disk marker); key bytes verbatim; value bytes
+verbatim; `create_if_missing(true)` and otherwise `Options::default()`. That is
+the whole list.
+
+### Verified on the final tree
+
+- `make interop` → **9 passed; 0 failed**, `EXIT=0`
+- `cargo remote-3000 -r fly -d 1.95.0 -- test --workspace` → `EXIT=0`:
+  19 + 77 (12 ignored) + 6 + 2 + 3 golden + **9 interop** + 1 doctest
+- `cargo remote-3000 -r fly -d 1.95.0 -- clippy --workspace --all-targets -- --deny warnings`
+  → `EXIT=0`, zero warnings
+- **Falsifiable, both directions.** The write probe's own comparison caught an
+  injected flipped bit at byte 21 of 22 (`expected 65, found 64`), and the read
+  probe's at byte 171 of 172. The corruption is applied to an in-memory copy, so
+  no on-disk revert is needed.
+- Engine crate untouched; `Cargo.lock` unchanged; no dependency added.
+
+### What this does NOT prove
+
+- **No tier.** Raw RocksDB with no `OPTIONS` profile, no WAL recovery, no
+  reopen-after-crash, no commit semantics. This shows a reader can open what we
+  write; it does not show our engine is equivalent.
+- **No key class is proven complete** — the same limit the golden and read halves
+  record.
+- **Small.** One SST per flush, no compaction, so compression, blob files,
+  two-level indexes and partitioned filters remain configured-but-unexercised.
+- **Source-derived, not observed:** that upstream sets `prefix_same_as_start` on
+  that range (R-0057) is read from `surrealdb-kvs-rocksdb`. What was observed is
+  the row set, not the `ReadOptions`.
+
+### Correction to my own documentation, found by this tranche
+
+`AGENTS.md` documented a command that **does not work**:
+
+```
+cargo remote-3000 -r fly -d 1.95.0 build -c=debug/surrealdb-ds-server -p surrealdb-ds-server
+error: invalid value 'surrealdb-ds-server' for '--ssh-port <PORT>'
+```
+
+cargo-remote parses its own flags *after* the cargo subcommand too, and `-p` is
+its `--ssh-port`. The `--` terminator is what keeps cargo's `-p` away from
+cargo-remote's. Verified both the failure and the fix; every example in
+`AGENTS.md`, `docs/remote-builds.md` and the `shared-flyio-build-server` skill now
+carries `--`. This is the second time a `-p` has collided with cargo-remote's own
+flags in this project, and it will happen again to anyone who skips the
+terminator.
+
+### Next action
+
+ADR-0012 **step 2**: restart-safe local persistence. Create/open/reopen, atomic
+write batches, tombstones, WAL recovery, and behaviour after a crash at each
+commit boundary. That is the first step that is about durability rather than
+format, and crash recovery is the thing a readable directory cannot evidence.
+
+---
+
 ## 2026-10-04 (later still) — On-disk interop, read half: our reader opens upstream's directory
 
 **ADR-0008's read half is confirmed.** `make interop` opens a directory upstream's

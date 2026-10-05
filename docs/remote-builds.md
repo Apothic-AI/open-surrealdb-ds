@@ -16,19 +16,21 @@ not change for us.
 export PATH="$HOME/.cargo/bin:$PATH"
 cd /home/bitnom/Code/open-surrealdb-ds
 
-cargo remote-3000 -r fly -d 1.95.0 check  --workspace --all-targets
-cargo remote-3000 -r fly -d 1.95.0 clippy --workspace --all-targets -- --deny warnings
-cargo remote-3000 -r fly -d 1.95.0 test   --workspace
+cargo remote-3000 -r fly -d 1.95.0 -- check  --workspace --all-targets
+cargo remote-3000 -r fly -d 1.95.0 -- clippy --workspace --all-targets -- --deny warnings
+cargo remote-3000 -r fly -d 1.95.0 -- test   --workspace
 ```
 
 These return output and nothing else, because cargo-remote copies artifacts back
 only under `--copy-back`. To get the server binary for `make smoke`:
 
 ```bash
-cargo remote-3000 -r fly -d 1.95.0 build -c=debug/surrealdb-ds-server -p surrealdb-ds-server
+cargo remote-3000 -r fly -d 1.95.0 -- build -c=debug/surrealdb-ds-server -p surrealdb-ds-server
 ```
 
-`-d 1.95.0` is mandatory; see the skill's Traps.
+`-d 1.95.0` is mandatory, and so is the `--` before the cargo arguments — cargo-remote
+parses its own flags after the subcommand too, and its `-p` is `--ssh-port`. See the
+skill's Traps.
 
 The `Makefile` still calls local `cargo`, so `make check` and friends remain the
 fallback and the local commands of record. `make check` and `make test` are what

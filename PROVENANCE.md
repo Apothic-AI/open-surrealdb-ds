@@ -121,6 +121,10 @@ and a date. Add new records as work proceeds; never edit a citation in place.
 | R-0052 | The extractor's *computation* is nevertheless load-bearing, and a wrong one **fails silently**: under `ReadOptions::set_prefix_same_as_start(true)` the same prefix-restricted seek returns 2 rows with the correct extractor and 12 with a mismatched one or none — a wider answer, never an error. On a full forward scan the mismatch is invisible, so byte-equality against a whole keyspace does **not** validate the extractor | OBS | `cargo test -p surrealdb-ds-server --test interop a_mismatched_extractor_silently_widens_a_prefix_restricted_read`; seek key `/*\0\0\0\0*\0\0\0\0*person\0*\0`, upstream-written directory, 55-key dataset | 2026-10-04 | recorded, verified |
 | R-0053 | A clean shutdown **rewrites the node row**: upstream archives its own `/!nd{nd}` entry on the way out, so `Node.gc` goes `false -> true` and byte 27 of that 29-byte value changes. Measured: 1 of 55 keys differs between a keyspace dumped through a live `Datastore` and the same directory read after `shutdown()`. A harness that dumps through a live writer and then reads the directory is comparing two different moments | OBS | `cargo test -p surrealdb-ds-server --test interop a_clean_shutdown_rewrites_the_node_row`; `surrealdb-catalog` 3.3.0 `src/node.rs` `Node { id, heartbeat, gc, http_endpoint }` — field order, for reading the byte | 2026-10-04 | recorded, verified |
 | R-0054 | The RocksDB binding upstream uses is the SurrealDB-maintained fork `surrealdb-rocksdb` **0.24.0-surreal.5** over `surrealdb-librocksdb-sys` **0.18.3+11.0.0-4** (RocksDB **11.0.0**), requested with features `lz4` + `snappy` only. The public `rocksdb` crate's newest line resolves to `librocksdb-sys` 0.19.0 = RocksDB **11.8.1**, and its 0.24.0 line to 0.17.3 = RocksDB **10.4.2**. `format_version=7` is readable by all three (`kLatestFormatVersion`/`kLatestBbtFormatVersion = 7`, read floor 2), so **format_version does not discriminate between them** | PUBAPI | crates.io sparse index `ro/ck/rocksdb` and `li/br/librocksdb-sys`, read 2026-10-04; `surrealdb-kvs-rocksdb` 3.3.0 `Cargo.toml` `[dependencies.rocksdb]`; `table/format.h` in each tree | 2026-10-04 | recorded, verified |
+| R-0055 | A directory written by our own `rocksdb` binding with **no prefix extractor**, one column family (RocksDB's default, the only one upstream uses), explicit key bytes, flushed to SSTs and closed, is opened by `surrealdb-kvs-rocksdb`'s reader; the whole live keyspace reads back byte-identically (7 keys / 108 value bytes, 1 tombstone, 2 SSTs). A point read returns the right value and the tombstoned key reads absent. No special column family or on-disk marker is needed for upstream's `OptimisticTransactionDB` path to open a plain `DB` directory | OBS | `make interop` — `cargo test -p surrealdb-ds-server --test interop we_write_a_directory_upstream_can_open_and_read`; 2026-10-05 | recorded, verified |
+| R-0056 | Bounded range reads through upstream's reader over a directory we wrote with **no prefix extractor** return **exactly** the bounded slice of the full keyspace — 2 record rows, 1 index, 1 metadata, 1 edge, 1 edge-document, 5 cross-category, 1 root row — with no silently widened or dropped rows. This covers both modes upstream selects: bounds that are in-domain and share an extracted prefix, and bounds that differ or are out of domain. Our own reader under explicit lower/upper bounds returns the same slices | OBS | `make interop` — same test as R-0055; `src/lib.rs` `scan_read_options` / `apply_prefix_mode` | 2026-10-05 | recorded, verified |
+| R-0057 | `surrealdb-kvs-rocksdb` chooses the scan prefix mode **per range**: `ReadOptions::set_prefix_same_as_start(true)` when *both* bounds are in the extractor's domain and extract to the same prefix, else `set_total_order_seek(true)`; explicit iterate lower/upper bounds are set in both cases. On open it installs `TablePrefix.v1` because `RocksDbConfig::prefix_extractor_enabled` defaults to `true`. A file written with no extractor is therefore still read under a prefix-restricted path | SRC | `surrealdb-kvs-rocksdb` 3.3.0 `src/lib.rs` `apply_prefix_mode` (L970–991), `scan_read_options` (L996–1016); `src/cnf.rs` `RocksDbConfig::default` `prefix_extractor_enabled: true` (L644) — interaction shape only, no code copied | 2026-10-05 | recorded, verified |
+| R-0058 | After upstream's reader writes one key and deletes another through a directory we wrote, both our reader and upstream's reader agree byte-identically on the net effect: the new key present, the deleted key absent, and the tombstone the writer already left still absent | OBS | `make interop` — same test as R-0055 (steps 3–5) | 2026-10-05 | recorded, verified |
 
 ---
 
@@ -226,6 +230,46 @@ What it does **not** establish, so that a green run is not read as more than it 
    writing: `compression_per_level` is `kNoCompression:kLZ4×4:kZSTD×3`, hardcoded
    upstream, and a writer that does not reproduce it produces files upstream can
    still read — but not files upstream would have produced.
+
+---
+
+## Closed by the write probe (ADR-0012 step 1), and how far
+
+`crates/surrealdb-ds-server/tests/interop.rs` now also writes a small keyspace
+with `rocksdb` as **our** dependency — no prefix extractor, one default column
+family, explicit bounds, two flushed SSTs, one tombstone — and hands it to
+upstream's reader. The whole keyspace reads back byte-identically, the bounded
+ranges return exactly the bounded slice (the failure ADR-0011 showed is silent),
+the point reads are right, and a write/delete round trip through upstream leaves
+both readers agreeing on the net effect. Records: **R-0055** through **R-0058**.
+
+Two things are worth separating, because the pass is not the interesting part:
+
+- **The open is not the result; the ranges are.** ADR-0011 established that a
+  wrong prefix extractor widens a prefix-restricted read without an error, and
+  that byte equality cannot see it. So the writer installs no extractor at all
+  and the probe asserts bounded ranges against the bounded slice of the full
+  read — including a range whose ends share an in-domain prefix, the path on
+  which upstream's reader enables `prefix_same_as_start` (R-0057). That is the
+  assertion a wrong filter would break.
+- **`OPTIONS` is not the spec.** Our directory records no prefix extractor;
+  upstream still opens it, because `DB::open` never reads the on-disk `OPTIONS`
+  file (R-0051). The directory that step 6's export profile must produce is a
+  separate, stricter thing than the directory this probe proves is readable.
+
+What it does **not** establish, so a green run is not read as more than it is:
+
+1. **No tier.** Raw RocksDB, no WAL recovery, no commit semantics, no reopen
+   after a crash. ADR-0012 steps 2–6 are the tier; this is the one-day spike.
+2. **No key class is proven complete**, the same limit the golden and interop
+   read halves record.
+3. **One SST per flush and no compaction**, so compression, blob files,
+   two-level indexes and partitioned filters remain configured-but-unexercised.
+4. **The falsifiability is on the comparison, not on upsets to the extractor.**
+   A flipped bit in what upstream hands back is caught and named
+   (`the_write_probe_comparison_catches_a_flipped_bit`); the widening class
+   itself is demonstrated on upstream's directory by
+   `a_mismatched_extractor_silently_widens_a_prefix_restricted_read`.
 
 ---
 
