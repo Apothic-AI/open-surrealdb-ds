@@ -8,6 +8,159 @@ Status legend: `[x]` done and verified · `[~]` in progress · `[ ]` not started
 
 ---
 
+## 2026-10-04 (later still) — On-disk interop, read half: our reader opens upstream's directory
+
+**ADR-0008's read half is confirmed.** `make interop` opens a directory upstream's
+own engine wrote, using `rocksdb` as *our* dependency, and reads back **55 keys /
+1526 value bytes byte-identically** — every key and every value, no exclusions.
+
+But three claims of mine were wrong, and the corrections matter more than the
+confirmation. All recorded in ADR-0011.
+
+### Correction 1 — a missing prefix-extractor name is not an open failure
+
+ADR-0008 said `surrealdb.TablePrefix.v1` must be registered by that exact name or
+the open *fails*. **It does not read the on-disk `OPTIONS` file at all.** The
+directory opens with no extractor, and equally with one registered under a
+deliberately wrong name. Both are asserted as tests, because the premise was
+load-bearing and false (R-0051). The name in `OPTIONS` is inert.
+
+### Correction 2 — the real failure mode is worse than an error
+
+A wrong extractor does not fail. It **silently widens** the read: a
+prefix-restricted seek returns the entire run instead of the narrowed range.
+
+```
+2 rows with our extractor, 24 with a mismatched one, 24 with none — wider, not an error
+```
+
+Same hazard class as this project's other correctness risks: a subtly wrong rule
+producing **silently wrong data rather than an error**. Worse than the open
+failure ADR-0008 predicted, because it will not announce itself.
+
+### Correction 3 — byte equality cannot validate the extractor
+
+Injecting an off-by-one into our extractor left the headline byte-equality test
+**green**. Reading a whole keyspace and comparing it byte-for-byte cannot
+distinguish a correct prefix extractor from a slightly-short one, because a
+too-short prefix reads *more* rows and the comparison still matches. So the
+extractor needs its own range assertions, which is why
+`a_mismatched_extractor_silently_widens_a_prefix_restricted_read` exists.
+
+### `TablePrefix.v1`, as measured
+
+Variable-length, ending at and including a one-byte discriminator. In domain iff
+≥14 bytes, `key[0,1,6,11]` are `/ * * *`, a `\0` at offset ≥12, and ≥1 byte after
+it; prefix is `key[..null_pos + 2]`. `*` records, `+` index, `!` metadata, `~`
+edges, `&` refs. Out-of-domain keys pass through unchanged and are excluded by
+`InDomain`. 39 of our 55 keys are in domain. `SRC`, format shape only (R-0050).
+
+### The binding was a cost decision, not a necessity
+
+ADR-0010 implied the SurrealDB fork was required. **It is not.**
+`format_version = 7` does not discriminate: `kLatestBbtFormatVersion` is 7 in
+RocksDB 11.0.0, 11.8.1 and 10.4.2, read floor 2 in all three. We use
+`surrealdb-rocksdb` 0.24.0-surreal.5 (RocksDB 11.0.0) because it is **already in
+our `Cargo.lock`** — one edge, zero rebuild, against a full C++ rebuild of a
+different RocksDB. Features pinned to `lz4`+`snappy`; defaults would add
+zstd/zlib/bzip2/bindgen and force that recompile.
+
+It is a SurrealDB-maintained fork, so `NOTICE` gained a fourth licensing path
+rather than letting a crate that is neither vendored nor ours-by-name pass
+unremarked.
+
+### Verified, and falsifiable
+
+- 55 keys / 1526 bytes, our reader == upstream's (`our_reader_opens_an_upstream_written_directory`).
+- Wrong extractor widens rather than errors (2 vs 12 rows in the recorded run).
+- Reader reads SSTs, not just the WAL; a clean shutdown rewrites its own `/!nd`
+  row, byte 27 (R-0053) — which cost a round and would have looked like corruption.
+- The comparison catches a flipped bit; the harness is falsifiable (injected
+  `pop_last()` → 3 failures; injected extractor off-by-one → 2 failures; reverted).
+- `make golden` unregressed at 55/1526, manifest byte-identical.
+
+### What this does NOT prove
+
+**Any writing.** ADR-0008's other half — a directory *we* wrote, opened by
+upstream — is entirely untested. Also: key-class completeness; anything past one
+L0 SST (compression, blob files, two-level indexes and partitioned filters are all
+configured in `OPTIONS` and none exercised — `bottommost_compression=kZSTD` is
+never reached, because upstream links only lz4 and snappy, so `OPTIONS` records
+defaults, not behaviour); bloom-filter correctness at scale; and the Rust API's
+stability.
+
+### Next action
+
+The local durable tier, with **"upstream's engine opens a directory we wrote"** as
+its first milestone rather than a later integration test — it forces every format
+question while the surface is still small, and it gives an unambiguous pass/fail.
+Per Correction 3, that milestone needs range assertions on the prefix extractor,
+not byte equality.
+
+---
+
+## 2026-10-04 (later) — Builds run on a shared Debian server; the local disk is no longer the constraint
+
+Local `target/debug` was **32G against 18G free**, so local building had stopped
+being an option rather than merely being slow. `cargo clean` now reclaims it
+(net 7G — cargo's own 40.9GiB figure double-counts hardlinks from `deps/`), and
+the box does the compiling.
+
+### The server
+
+New app `open-surrealdb-ds-builder`: `debian:bookworm-slim` on `performance-8x`
+(8 dedicated cores, 16 GB), 100 GB volume at `/data`, reached over **2PN** only —
+no public port of any kind. A *separate app* because the pre-existing
+`fly-builder-glowing-aurora-7598` is a registered org build machine, where Fly
+refused both an image change (*"deploying over the remote builder is not
+allowed"*) and a second machine (*"remote builders may have only one volume"*).
+
+Debian is a hard requirement, not a preference — see the ADR-0009 entry below.
+
+**Multi-project by construction.** `/data/cargo` and `/data/rustup` are shared, so
+the crates.io cache and the toolchain are paid for once; each project gets its own
+tree under `/data/builds`, named by cargo-remote after a hash of the project path,
+so projects cannot collide and need no agreed name; and one build gets
+`[build] jobs = 4` of 8 cores so two projects divide the machine instead of
+starving. No project-specific state lives on the box.
+
+### Verified remotely, all exit 0
+
+```
+cargo remote-3000 -r fly -d 1.95.0 check  --workspace --all-targets    10m29s
+cargo remote-3000 -r fly -d 1.95.0 test   --workspace                  green
+cargo remote-3000 -r fly -d 1.95.0 clippy --workspace --all-targets \
+    -- --deny warnings                                                  clean
+  test: 19 + 77 (12 ignored) + 6 + 2 + 3 golden + 7 interop + 1, 0 failed
+```
+
+The whole tree is **3.8G on the box against 32G locally**, because debug info is
+off there and nothing is debugged on a build server. `-d 1.95.0` is mandatory:
+cargo-remote defaults the toolchain to `stable` and runs `rustup default` on every
+build, and there is no config-file key for it — omitting it silently installs and
+switches compiler versions, which must never be mistakable for a contract change.
+
+### Consequence for how we work
+
+`make check` and `make test` still call local `cargo` and remain the commands of
+record, because they are what CI runs. Remote builds are the fast path, not the
+definition of done. `make smoke` needs a local binary, which now takes an explicit
+`--copy-back`; it is the one command with no zero-artifact form.
+
+`AGENTS.md` is new, and the operational reference for the server is the
+`shared-flyio-build-server` agent skill, which carries the machine definitions and
+provision scripts — they describe a shared environment, so every project would
+otherwise carry a copy that drifts.
+
+### Baseline intact
+
+`make check` clean · `cargo clippy --workspace --all-targets -- --deny warnings`
+clean · `make test` 19 + 77 + 12 ignored + 6 + 2 + 3 + 1, 0 failed ·
+`make smoke` 10/10 against `ds+mem://` · `make golden` 55 keys / 1526 bytes ·
+`make interop` 55 keys / 1526 bytes.
+
+---
+
 ## 2026-10-04 — L2 is evidenced: 55 keys round-trip upstream → us → upstream, byte for byte
 
 **The project's stated definition of 1:1 is no longer an untested assumption.**
