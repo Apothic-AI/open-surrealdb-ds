@@ -12,7 +12,7 @@ UPSTREAM_DIR := upstream/surrealdb
 CARGO_FLAGS ?=
 
 .DEFAULT_GOAL := help
-.PHONY: help bootstrap check test conformance conformance-list golden golden-update interop run construct smoke audit-upstream clean
+.PHONY: help bootstrap check test conformance conformance-list golden golden-update interop durability run construct smoke audit-upstream clean
 
 help: ## Show this help
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -41,6 +41,9 @@ golden-update: ## Rewrite the golden manifest from a fresh upstream run (review 
 
 interop: ## Open an upstream-written RocksDB directory with our own reader, byte for byte
 	cargo $(CARGO_FLAGS) test -p surrealdb-ds-server --test interop -- --nocapture
+
+durability: ## SIGKILL the store at each commit boundary and measure what survives (ADR-0012 step 2)
+	cargo $(CARGO_FLAGS) test -p surrealdb-ds-server --test durability -- --nocapture
 
 construct: ## Construct the engine from a path and exit, without serving
 	cargo $(CARGO_FLAGS) run -q -p surrealdb-ds-server -- construct-only $(or $(PATH_ARG),ds+mem://)

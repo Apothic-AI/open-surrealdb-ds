@@ -1031,3 +1031,128 @@ not evidence any of it.
 - Upstream's on-disk format is itself versioned and supported across releases,
   which would make matching it cheaper than it looks.
 - The export profile turns out to need state the logical snapshot cannot carry.
+
+---
+
+## ADR-0013 — Durability is a parameter we pass, not a property the store has; and upstream gets it by grouping, not by fsyncing per commit
+
+**Status:** accepted · **Date:** 2026-10-06 · **Next free: ADR-0014
+
+Records what ADR-0012 step 2 measured. It changes one thing about how the storage
+layer must be built, and it corrects a claim that reads naturally and is wrong.
+
+### Step 2 conflated two questions
+
+The step was briefed as "is the local store actually restart-safe?" **Restart-safety
+and durability are different questions, and only the first is testable in this
+environment.**
+
+`SIGKILL` is a real process death — user-space buffers gone, `Drop` never run — but
+**the kernel page cache outlives the process**, so a commit already `write(2)`n into
+the WAL survives. Measured: with `sync = false`, **600/600 unsynced commits
+survived and 0 were lost** across 30 runs × 20 process kills. `sync` true and false
+are therefore *indistinguishable* to a kill-based harness, which is the opposite of
+what I expected and worth recording precisely because it is counter-intuitive.
+
+So: **the harness measures recovery, not durability.** That `sync = true` survives
+media loss is documented RocksDB behaviour and is **not measured** — discarding the
+page cache needs privileges this environment lacks. It is a "does not prove" item,
+not a result.
+
+### The decision that follows
+
+**Durability is a parameter the transaction layer passes, never a property the
+storage layer claims.** Every guarantee in the step-2 table is a property of *our
+configuration*:
+
+| Property | Requires |
+| --- | --- |
+| Per-commit durability | `WriteOptions::set_sync(true)` per commit, or a grouped `flush_wal(true)` |
+| Atomic write batches | `Options::default()` — one `WriteBatch` per commit is the atomic unit |
+| Tombstone durability | `Options::default()` |
+| Recovery from a crash | WAL enabled **and** a durability barrier |
+
+**Nothing about durability holds on the defaults.** Atomicity does, and it is free —
+but atomicity is not durability: a batch can be perfectly atomic and entirely lost.
+
+Three interface consequences, all observations from the measurements rather than
+design:
+
+- The interface must **distinguish "left the application" from "on media."** RocksDB
+  offers no query for which state a write is in, and the one proxy knob
+  (`manual_wal_flush`) cannot be trusted to report it.
+- **An awaited commit must not be conflated with a durable commit.** With default
+  `WriteOptions`, `write_opt` returning is not a durability event at all.
+- **Do not expose `manual_wal_flush` or a WAL toggle as barriers.** `manual_wal_flush`
+  measured **576/600 lost, 24/600 survived**; `disable_wal` **595/600 lost, 5/600
+  survived** — both usually lost, occasionally kept, **never an error**. That is the
+  same silent-wrong-answer class as ADR-0011's prefix extractor, and the rates are
+  timing-dependent, which is why they are recorded as counts rather than verdicts.
+
+### Correction: upstream does not fsync per commit
+
+The step-2 report concluded that per-commit durability "requires `set_sync(true)`,
+per commit. Nothing else." True as a sufficient condition in isolation, and
+**misleading as a design target**, because upstream — whose `RocksDbConfig` defaults
+to `SyncMode::Every` and logs *"Sync mode: every transaction commit"* — **never uses
+per-transaction sync**:
+
+```rust
+// surrealdb-kvs-rocksdb lib.rs:790
+// "Per-transaction sync is never used. When sync=every is configured, the commit
+//  coordinator handles grouped fsync after parallel transaction commits."
+wo.set_sync(false);
+```
+
+`SyncMode::Every` instead configures a **grouped** commit
+(`commit_coordinator.rs`): `set_wal_bytes_per_sync(512 KiB)` plus
+`set_manual_wal_flush(true)`, and a coordinator that batches waiters and performs a
+single `flush_wal(true)` for the whole group.
+
+This reframes both step-2 negatives. `manual_wal_flush = true` is **not** the losing
+configuration on its own — it is half of a design whose other half is the
+coordinator's explicit `flush_wal(true)`. The measured failure belongs to the knob
+*alone*, which is what a probe can measure and what a design must not mistake for
+the whole.
+
+Adopting per-commit `set_sync(true)` because the probe found it sufficient would
+have made our commit path an order of magnitude slower than upstream's for no gain.
+**Grouped commit is the mechanism to copy**, and its own log line is a simplification
+worth not repeating without the code beside it.
+
+### RocksDB's transaction path is confirmed hazardous
+
+ADR-0012 predicted that inheriting RocksDB's conflict detection would reject the
+overlapping blind writes the `surrealds` contract requires to all commit (ADR-0006,
+R-0034). Measured: two blind puts on one key, **the second commit is rejected**,
+`final value = "one"` — **with and without `set_snapshot(true)`**. The hazard does
+not need a snapshot to bite, so the prediction is confirmed rather than qualified.
+
+Also useful: **a plain `DB` recovers an `OptimisticTransactionDB` directory** (the
+reverse of R-0055), so the plain write path is viable. Step 3 should take it and
+implement commit identity itself, which is what ADR-0012 already argues.
+
+### Consequences
+
+- **Step 3's storage interface carries durability as an explicit parameter**, and
+  treats one `WriteBatch` as its atomic unit.
+- **Grouped commit is in scope for step 4**, not an optimisation to add later.
+  `grouped_commit_max_batch_size` and `wal_bytes_per_sync` interact, and neither is
+  in our probe's configuration table yet.
+- **The engine's local in-memory tier has no equivalent of this problem** — it is
+  lost on restart by construction — so the two implementations differ in a way the
+  factored interface must express rather than hide.
+- **Two assertions in the tranche were wrong and the harness caught them**, which is
+  the reason to keep one: "no SST after recovery" is false because RocksDB's
+  *recovery* produces an L0 SST as it opens; and the two emptiness probes failed as
+  strict assertions about 1 run in 10 under parallel libtest, reproducibly enough to
+  chase. That investigation is what produced the `manual_wal_flush` finding — the
+  failures were real, not flaky.
+
+### Revisit if
+
+- Step 4 finds grouped commit insufficient for the quorum path, in which case the
+  interface's durability parameter has to distinguish "grouped" from "per-commit"
+  rather than carrying a single flag.
+- A future upstream release changes how `SyncMode::Every` is implemented, which
+  would make this record's mechanism description historical rather than current.

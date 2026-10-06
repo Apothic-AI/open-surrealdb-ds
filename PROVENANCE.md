@@ -125,6 +125,16 @@ and a date. Add new records as work proceeds; never edit a citation in place.
 | R-0056 | Bounded range reads through upstream's reader over a directory we wrote with **no prefix extractor** return **exactly** the bounded slice of the full keyspace — 2 record rows, 1 index, 1 metadata, 1 edge, 1 edge-document, 5 cross-category, 1 root row — with no silently widened or dropped rows. This covers both modes upstream selects: bounds that are in-domain and share an extracted prefix, and bounds that differ or are out of domain. Our own reader under explicit lower/upper bounds returns the same slices | OBS | `make interop` — same test as R-0055; `src/lib.rs` `scan_read_options` / `apply_prefix_mode` | 2026-10-05 | recorded, verified |
 | R-0057 | `surrealdb-kvs-rocksdb` chooses the scan prefix mode **per range**: `ReadOptions::set_prefix_same_as_start(true)` when *both* bounds are in the extractor's domain and extract to the same prefix, else `set_total_order_seek(true)`; explicit iterate lower/upper bounds are set in both cases. On open it installs `TablePrefix.v1` because `RocksDbConfig::prefix_extractor_enabled` defaults to `true`. A file written with no extractor is therefore still read under a prefix-restricted path | SRC | `surrealdb-kvs-rocksdb` 3.3.0 `src/lib.rs` `apply_prefix_mode` (L970–991), `scan_read_options` (L996–1016); `src/cnf.rs` `RocksDbConfig::default` `prefix_extractor_enabled: true` (L644) — interaction shape only, no code copied | 2026-10-05 | recorded, verified |
 | R-0058 | After upstream's reader writes one key and deletes another through a directory we wrote, both our reader and upstream's reader agree byte-identically on the net effect: the new key present, the deleted key absent, and the tombstone the writer already left still absent | OBS | `make interop` — same test as R-0055 (steps 3–5) | 2026-10-05 | recorded, verified |
+| R-0059 | A keyspace written through our own `surrealdb-rocksdb` binding, **closed cleanly**, and reopened reads back byte-identically — and identically across a *second* reopen, so the first reopen may itself have left a WAL. A point read returns the right value. This is the baseline every crash property is judged against: a clean close that is not faithful makes a crash result meaningless | OBS | `make durability` — `cargo test -p surrealdb-ds-server --test durability a_clean_close_reopens_byte_identically`; 16-key payload | 2026-10-06 | recorded, verified |
+| R-0060 | With `WriteOptions::sync = true`, a commit acknowledged immediately before `SIGKILL` is recovered in full from the **WAL**, not from an SST: the child leaves 0 `.sst` files and a non-empty `.log`, and a plain `DB::open` replays it. The SST count is checked **before** the parent opens, because RocksDB's own recovery flushes the replayed memtable to an L0 SST as it opens, which makes "no SST" meaningless afterwards | OBS | `make durability` — same test; `surrealdb-librocksdb-sys` 0.18.3+11.0.0-4 `db/db_impl/db_impl_write.cc` L1389–1398 — when `sync` is set the write path `FlushWAL(true)` under `manual_wal_flush_`, else `SyncWAL()` | 2026-10-06 | recorded, verified |
+| R-0061 | **`SIGKILL` does not simulate power loss, and cannot.** The kernel page cache outlives the process, so a `sync = false` commit survives: measured **600 of 600** process kills returned the full commit, 0 lost. `sync = true` and `sync = false` are therefore *indistinguishable* to a kill-based harness. That `sync = true` survives media loss is documented behaviour, **not measured here** — nothing in this test can drop the page cache. A durability harness built only on `SIGKILL` proves recovery, not durability | OBS | `make durability` — `an_unsynced_commit_is_measured_not_assumed`; 30 runs × 20 trials | 2026-10-06 | recorded, verified; **narrows the step-2 brief's premise** |
+| R-0062 | `Options::manual_wal_flush = true` with `sync = false` holds the WAL record in the application, so a killed writer usually loses the commit — measured **576 of 600 lost** — but it is **not a barrier**: the engine flushed the buffer on its own schedule often enough that **24 of 600 survived** a `SIGKILL` landing microseconds after the commit was acknowledged. The child reports 0 WAL bytes at commit time and the parent finds the full 403-byte record (7-byte WAL header + 396-byte batch) on disk after the kill, with no memtable flush in the child's own info log. **Only `sync` is a caller-held durability barrier**; "I did not fsync" is not the same claim as "this will not be on disk" | OBS | `make durability` — `manual_wal_flush_loses_the_unsynced_commit_but_not_always`; 30 runs × 20 trials; corroborating code: `db/log_writer.cc` `Writer::AddRecord` L189–193 — the buffer is flushed only when `!manual_flush_`, and the buffer is flushed automatically when it cannot fit a write (`file/writable_file_writer.cc` `Append` L104–118) | 2026-10-06 | recorded, verified; **negative result, load-bearing for step 3** |
+| R-0063 | `WriteOptions::disable_wal = true` removes the durable path: measured **595 of 600 lost** to `SIGKILL`, the surviving 5 attributable to a memtable flush the engine chose on its own (the only route a WAL-less write reaches an SST). The WAL is therefore the mechanism, not a convenience — and its absence is probabilistic, not an error, so a caller cannot treat a disabled WAL as "fails loudly" | OBS | `make durability` — `disabling_the_wal_loses_the_commit_but_not_always`; 30 runs × 20 trials | 2026-10-06 | recorded, verified; **negative result** |
+| R-0064 | An explicit `DB::flush_wal(true)` after a `manual_wal_flush` commit moves the buffered record and the commit is recovered in full, with no `sync`. So `flush_wal` and `sync` are distinct operations: the first is a caller-invoked barrier (the buffer is out of the application), the second is the fsync the caller holds per write | OBS | `make durability` — `an_explicit_wal_flush_buys_back_the_unsynced_commit` | 2026-10-06 | recorded, verified |
+| R-0065 | A multi-key `WriteBatch` is **all-or-nothing** across a crash, on two independent legs: (a) a child looping 400-key batches (≈110 KiB, several WAL blocks each) and killed mid-write left **every** batch complete — 118 batches / 47 200 keys in the recorded run, batch ids sequential with no gap, 0 SSTs left by the child; (b) deterministically, truncating the last 256 bytes of a 111 240-byte WAL record recovers **0 keys, not 400** — a torn record is dropped whole. A partial batch is the failure the property forbids and the harness bails on one | OBS | `make durability` — `a_killed_writer_never_leaves_a_partial_batch`, `a_torn_wal_record_is_dropped_not_half_applied`; the truncation is on the WAL only, and the directory is deliberately **not** opened before the tear because recovery would flush a replayed memtable to an SST and mask the result | 2026-10-06 | recorded, verified |
+| R-0066 | Deletes survive a crash **and** a compaction in both placements: the tombstone in the WAL, and the tombstone flushed to its own SST so compaction must merge it away. Measured: 24 live keys intact and 8 deleted keys absent after recovery, again after `flush()` + `compact_range(None, None)`, and again after a second reopen. Compaction is where a resurrected value would appear and nowhere earlier | OBS | `make durability` — `tombstones_survive_a_crash_and_a_compaction` | 2026-10-06 | recorded, verified |
+| R-0067 | A commit made through `OptimisticTransactionDB` with `sync = true` is durable under `SIGKILL`, and a **plain `DB`** recovers its directory — upstream's transaction path and our reader agree without any on-disk marker | OBS | `make durability` — `an_optimistic_commit_is_durable_under_sigkill`; the reverse direction is R-0055 | 2026-10-06 | recorded, verified |
+| R-0068 | **`OptimisticTransactionDB` rejects overlapping blind writes to one key** — measured, not assumed: of two concurrent transactions both blind-putting one key, the first commit succeeds and the second **fails**, with or without `OptimisticTransactionOptions::set_snapshot(true)`, leaving the first writer's value. This is the `surrealds` contract inverted (R-0034: overlapping blind writes must all commit, serialised in stamp order), so RocksDB's transaction API cannot be used naively as the durable tier's commit path — it fails conformance for the right-looking reason | OBS | `make durability` — `optimistic_overlapping_blind_writes_are_measured`; documented behaviour in `surrealdb-rocksdb` 0.24.0-surreal.5 `src/transactions/transaction.rs` `commit` (L141) — a `TryAgain` may be returned if the memtable history no longer covers the write set | 2026-10-06 | recorded, verified; **confirms ADR-0012's stated risk** |
 
 ---
 
@@ -270,6 +280,39 @@ What it does **not** establish, so a green run is not read as more than it is:
    (`the_write_probe_comparison_catches_a_flipped_bit`); the widening class
    itself is demonstrated on upstream's directory by
    `a_mismatched_extractor_silently_widens_a_prefix_restricted_read`.
+
+---
+
+## Closed by the durability probe (ADR-0012 step 2), and how far
+
+`crates/surrealdb-ds-server/tests/durability.rs` is a measurement harness, not a
+tier. It re-execs the test binary as a crash writer (`DS_DURABILITY_CHILD`), lets
+it commit, and `SIGKILL`s it, because an in-process panic runs `Drop` and proves
+nothing about recovery. Records: **R-0059** through **R-0068**.
+
+The result is a list of properties with the configuration each one needs, and the
+configuration is the point:
+
+- **Holds with configuration:** per-commit durability needs `WriteOptions::sync`.
+  Atomic batches, tombstones, and clean reopen hold on the defaults.
+- **Holds without configuration:** nothing about durability does. `sync` is off
+  by default, and the harness's own measurement shows the default commit survives
+  a kill for the wrong reason (R-0061).
+- **Does not hold:** `manual_wal_flush` and `disable_wal` are *not* durability
+  barriers — they lose the commit usually (576/600, 595/600) and survive it
+  occasionally (24/600, 5/600) with no error anywhere (R-0062, R-0063). A caller
+  cannot rely on either as a deliberate barrier.
+
+What it does **not** establish:
+
+1. **Power loss.** Everything here is `SIGKILL`, which preserves the page cache.
+   The `sync` guarantee that matters is documented, not measured (R-0061).
+2. **A tier.** No `Transactable`, no read validation, no commit identity.
+3. **Distributed commit identity.** A local sequence number is not a cluster-wide
+   timestamp (ADR-0012); nothing here tests one.
+4. **Stable rates.** The two "does not hold" rates are timing-dependent under
+   parallel libtest, which is exactly why they are reported as counts over many
+   process kills rather than as verdicts.
 
 ---
 

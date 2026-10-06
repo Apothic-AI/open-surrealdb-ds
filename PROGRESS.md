@@ -8,6 +8,197 @@ Status legend: `[x]` done and verified · `[~]` in progress · `[ ]` not started
 
 ---
 
+## 2026-10-06 — ADR-0012 step 2: what the local store actually guarantees, and with which knobs
+
+A measurement, not a tier. `crates/surrealdb-ds-server/tests/durability.rs` —
+**1 094 lines, 16 tests**, `make durability` — establishes which durability
+properties the local store provides and **which configuration each one requires**.
+
+```
+test result: ok. 16 passed; 0 failed; 0 ignored
+```
+
+### The honest crash
+
+A real process death. An in-process panic runs `Drop`, closes RocksDB cleanly and
+checkpoints the WAL, so it proves nothing. The harness re-execs its own test
+binary: the parent sets `DS_DURABILITY_CHILD`, the child opens the directory,
+commits, prints a sentinel and parks until the parent delivers `SIGKILL`. The
+parent **reaps before touching the directory**, because RocksDB holds an
+exclusive lock and reopening early fails for the wrong reason.
+
+### Verdict per property
+
+| Property | Verdict |
+| --- | --- |
+| Clean reopen | holds on the defaults |
+| Unclean death → WAL recovery | holds with `WriteOptions::sync = true`; 16/16 keys, child left **0 `.sst`** so the value can only have come from WAL replay |
+| Atomic write batches | holds on the defaults — 100 batches / 40 000 keys, every batch all-or-nothing |
+| Atomicity at a torn record | holds **deterministically** — truncating the last 256 bytes of a 111 240-byte WAL record recovers **0 keys, not 400** |
+| Tombstone durability | holds on the defaults — 24 live keys intact, 8 deleted absent, after the crash, after `flush()` + `compact_range`, and after a second reopen; in both WAL- and SST-placed form |
+| Reopen-after-crash with a reader | holds — every recovery check is a full forward scan, never point gets alone |
+| **`manual_wal_flush` as a barrier** | **does not hold — 576/600 lost, 24/600 survived** |
+| **`disable_wal`** | **mostly lost, not an error — 595/600 lost, 5/600 survived** |
+| **Overlapping blind writes on `OptimisticTransactionDB`** | **does not hold — the second commit is rejected**, with *and* without `set_snapshot(true)` |
+
+### Configuration required — the actual deliverable
+
+A property that only holds with a specific setting is a property of **our
+configuration**, not of the store.
+
+| Property | Requires |
+| --- | --- |
+| Per-commit durability | `WriteOptions::set_sync(true)`, per commit. Nothing else |
+| Atomic write batches | `Options::default()`. One `WriteBatch` per commit is the unit of atomicity |
+| Tombstone durability | `Options::default()` |
+| Recovery from a crash | WAL enabled **and** a durability barrier (`sync`) |
+| "The commit is on media" | `sync = true`, **or** an explicit `DB::flush_wal(true)` — separate operations, either suffices for process-kill recovery |
+| `manual_wal_flush` | **not a configuration that buys anything** |
+
+**Nothing about durability holds on the defaults.** Atomic batches and tombstones
+do, but those are *atomicity* properties — an atomic batch can still be entirely
+lost.
+
+### The sharpest negative: `manual_wal_flush` is a hint, not a barrier
+
+The expectation was that a killed writer loses the commit deterministically. It
+does not: **576/600 lost, 24/600 survived** a `SIGKILL` landing microseconds after
+acknowledgement, with no error anywhere.
+
+The instrumentation pins down where the record went. The child reports its own
+WAL size at commit time; the parent measures again after the kill:
+
+```
+child reported `DURABILITY_READY wal=0 bytes`, wal after kill 403 bytes
+```
+
+403 bytes is exactly one record: a 7-byte header plus a 396-byte `WriteBatch`. So
+at acknowledgement the record was provably still in the child's address space, and
+by the time the parent had reaped it, it was whole on disk. Ruled out with
+evidence: not a memtable flush (the child's own info log records none), not a
+buffer overflow (`WritableFileWriter::Append` flushes only when the remaining
+buffer capacity is smaller than the write), not `sync` (the options carried
+`sync = false`), and not the explicit flush API (`Writer::AddRecord` skips the
+automatic flush precisely because `manual_flush_` is set).
+
+The flush is internal to the log writer and asynchronous, and **which path does it
+was not identified** — stated as unresolved rather than guessed at. The failure
+mode — *usually lost, occasionally kept, never an error* — is the same
+silent-wrong-answer class as ADR-0011's prefix extractor.
+
+### Corrected by this tranche: `sync = false` is not "usually present"
+
+My brief predicted a partial survival rate with `sync` off. Measured: **600/600
+survived, 0 lost**, and always will be under `SIGKILL`, because **the kernel page
+cache outlives the process**. So `sync` true and false are *indistinguishable* to a
+kill-based harness.
+
+**This harness measures recovery, not durability.** That `sync = true` survives
+*media* loss is documented RocksDB behaviour and is **not measured here** —
+dropping the page cache needs privileges this environment lacks, and
+`posix_fadvise(DONTNEED)` does not discard dirty pages. Recorded as a "does not
+prove" item, not as a result.
+
+### What upstream actually does — checked in its source, and it is not `set_sync(true)`
+
+This is the finding that changes what we should build. Upstream's RocksDB tier
+defaults to `SyncMode::Every` (`RocksDbConfig::default`, `cnf.rs:598`) and logs
+*"Sync mode: every transaction commit"* — but **per-transaction sync is never
+used**:
+
+```rust
+// lib.rs:790 — "Per-transaction sync is never used."
+wo.set_sync(false);
+```
+
+Instead `SyncMode::Every` configures a **grouped** commit:
+
+```rust
+// commit_coordinator.rs:130
+opts.set_wal_bytes_per_sync(512 * 1024);
+opts.set_manual_wal_flush(true);
+// …then a CommitCoordinator that batches waiters and performs one
+// db.flush_wal(true) for the whole group.
+```
+
+So `manual_wal_flush = true` is **not** the losing configuration in isolation —
+it is half of a design, and the other half is the coordinator's explicit
+`flush_wal(true)`. The two negative results above are properties of the knob
+*alone*, which is exactly what a probe can measure and what a design must not
+mistake for the whole.
+
+Three consequences for step 3:
+
+1. **Grouped commit is how upstream gets per-commit durability without paying a
+   per-commit fsync**, and its own log line is a simplification of what the code
+   does. A comment reproducing that log line without the mechanism would mislead
+   the next reader, which is why it is written out here.
+2. **`wal_bytes_per_sync(512 KiB)` is a durability knob we have not considered.**
+   It bounds how much WAL can sit un-fsynced, so it interacts with
+   `grouped_commit_max_batch_size`. Neither is in `RocksDbConfig`'s defaults by
+   accident and neither is in our probe's configuration table yet.
+3. **RocksDB's transaction path is confirmed hazardous**, now more sharply:
+   overlapping blind writes are rejected with *and* without `set_snapshot(true)`,
+   so the hazard does not need a snapshot to bite. ADR-0012's stated risk is
+   confirmed rather than qualified. Separately, a **plain `DB` recovers an
+   `OptimisticTransactionDB` directory** (the reverse of R-0055), so a plain write
+   path is viable — which is what ADR-0012 argues for anyway.
+
+### Implications for the storage interface (observation, not design)
+
+- **Per-commit durability must be a parameter, not a property of the store.**
+- **The interface must distinguish "left the application" from "on media."**
+  RocksDB offers no query for which state a write is in, and §3.2 shows the one
+  proxy knob cannot be trusted to report it.
+- **An awaited commit must not be conflated with a durable commit.** With default
+  `WriteOptions`, `write_opt` returning is not a durability event at all.
+- **Atomicity is free and is per-`WriteBatch`** — the one strong default-on
+  guarantee, and it should be the interface's atomic unit. But it is atomicity,
+  not durability.
+- **Take the plain write path and implement commit identity ourselves**, rather
+  than inheriting RocksDB's transaction API and its conflict policy.
+
+### What this does NOT prove
+
+1. **Power loss.** Everything is `SIGKILL`, which preserves the page cache.
+2. **A tier.** No `Transactable`, no read validation, no commit identity, no
+   recovery reconciliation. Steps 3–6 are the tier.
+3. **Distributed commit identity.** A local RocksDB sequence number is not a
+   cluster-wide commit timestamp (ADR-0012).
+4. **Stability of the two negative rates** — timing-dependent, which is why they
+   are reported as counts over many process kills rather than as verdicts.
+5. **Key-class completeness** — a synthetic 16-key keyspace, not the golden
+   manifest.
+6. **Anything past single-process, single-node recovery.**
+
+### Falsifiability
+
+Each checker is shown rejecting bad input as its own test: the keyspace comparison
+(named missing and extra keys), the batch checker (`399/400 keys present, so a
+batch is not all-or-nothing`), and the tombstone checker (a resurrected key). All
+corrupt in-memory copies, so no on-disk revert is needed.
+
+The two emptiness probes were **strict assertions first, and failed
+reproducibly** — about 1 run in 10 under parallel libtest. That investigation is
+what produced the `manual_wal_flush` finding: the failures were real, not flaky.
+They are now rate measurements with a hard invariant attached (a *partial*
+keyspace never fails the run) and the counts reported.
+
+One assertion corrected mid-tranche: **"no SST after recovery" is false**, because
+RocksDB's *recovery itself* produces an L0 SST as it opens. The assertion now runs
+before the parent opens the directory, which is the only point at which it means
+what it says.
+
+### Next action
+
+ADR-0012 **step 3**: differential transaction semantics — factor the
+transaction-semantic layer over a small storage interface, with the in-memory
+store and RocksDB as two implementations, and run the same generated operation
+traces and conflict schedules against both. §3.4 and the
+`OptimisticTransactionDB` result say why the plain write path is the one to take.
+
+---
+
 ## 2026-10-05 — ADR-0012 step 1: a directory we write is one upstream can open and read correctly
 
 The **write** half of on-disk interop now works, as a deliberately small probe.

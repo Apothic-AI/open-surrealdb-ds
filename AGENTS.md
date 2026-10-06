@@ -71,6 +71,8 @@ All of these were green at the last commit:
 make check          # clean, zero warnings
 make test           # includes the 77-test upstream conformance suite
 make golden         # L2 round trip: upstream -> us -> upstream, byte for byte
+make interop        # both directions of on-disk interop with a real upstream store
+make durability     # SIGKILL a writer; which durability properties hold, and with which knobs
 make smoke          # HTTP round trip against ds+mem://
 cargo clippy --workspace --all-targets -- --deny warnings
 ```
@@ -87,10 +89,10 @@ and PROGRESS.md lists exactly which and what we test instead.
 - **`crates/surrealdb-ds/src/storage.rs` must never import `surrealdb_kvs`.**
   It is deliberately dependency-free so it survives a move to an independent
   implementation (ADR-0002). Return a local error type and map it in `txn.rs`.
-- **Add a provenance record (`R-NNNN`, next free R-0055) for any new
+- **Add a provenance record (`R-NNNN`, next free R-0069) for any new
   requirement**, with a source class (`DOC` · `REL` · `OBS` · `PUBAPI` · `SRC`
   — interface shape only — · `BIN`, never used) and a precise citation.
-- **An ADR for architecture decisions.** Next free is ADR-0012. Do not invent
+- **An ADR for architecture decisions.** Next free is ADR-0014. Do not invent
   numbers that are already taken.
 - **`docs/spec/` stays empty** unless a record backs it.
 - **Do not reimplement what already exists and works** (ADR-0002). Link it.
