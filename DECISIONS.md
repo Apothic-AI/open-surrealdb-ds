@@ -644,7 +644,8 @@ Three things were needed to make that work, and each cost a round trip:
    create it, and cargo-remote sources it; without it every remote build dies
    with `ash: cargo: not found`.
 
-`ops/fly-builder/provision.sh` captures all of this and is idempotent, because
+`provision.sh`, now in the `shared-flyio-build-server` skill, captures all of this and is
+idempotent, because
 the machine's root filesystem is ephemeral and `apk` packages do not survive a
 stop. `/data/bin/ensure-ready` exists for the same reason: `flyctl machine exec`
 argv-splits rather than using a shell, so a one-word executable on the volume is
@@ -681,7 +682,7 @@ non-destructively:
 So the Debian machine requires **destroying the current one**, which also
 discards `/data` and forces a rustup reinstall. That is an owner's decision
 because it is destructive and it costs machine-time, so it is not done here.
-`ops/fly-builder/fly.glibc.toml` is the config for it.
+`fly.glibc.toml`, now in the same skill, is the config for it.
 
 ### Consequences
 
@@ -987,6 +988,18 @@ can still open such a directory.
 `TablePrefix.v1` is deferred to a later optimisation or exact-options
 compatibility feature, and **the range assertions stay permanently** if it is ever
 added. Do not register a guessed extractor merely because its name matches.
+
+**Progress against these steps**, recorded here so the sequence is not re-derived:
+
+| Step | What | State |
+| --- | --- | --- |
+| 0 | Baseline, ADR-0007 golden harness | **done** 2026-10-04 |
+| 1 | Format probe — a directory we write, upstream reads | **done** 2026-10-05, `make interop` |
+| 2 | Restart-safe local persistence | **done** 2026-10-06, `make durability`, ADR-0013 |
+| 3 | Differential transaction semantics over a factored interface | **next** |
+| 4 | Durable commit identity, reconciliation, grouped commit | not started |
+| 5 | Distributed timestamps, quorum, recovery drain | not started |
+| 6 | Versioned stock-upstream-readable export profile | not started |
 
 ### Sequencing
 

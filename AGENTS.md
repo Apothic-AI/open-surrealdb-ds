@@ -9,31 +9,86 @@ A clean-room reimplementation of SurrealDB's distributed storage engine (the tie
 SurrealDB markets as "SurrealDS"). It links SurrealDB's published crates for the
 front end and the KV contract, and implements the storage engine itself.
 
-Phase 0 is closed: the engine registers as a KV backend and passes upstream's own
-contract suite. Phase 1 is byte compatibility.
+Phase 0 is closed. Phase 1 is byte compatibility, and is **measured rather than
+assumed**: L2 round-trip, on-disk interop in both directions, and the durability
+properties the local store actually provides. Storage is **still in-memory and
+single-node** — nothing is durable or replicated yet, and the durable tier is the
+work in progress.
+
+## Where to start
 
 Read, in order: `README.md`, `PROGRESS.md` (newest first — **verified vs
 intended**), `DECISIONS.md`, `PLAN.md`, `PROVENANCE.md`, `NOTICE`,
-`docs/architecture.md`, and `docs/remote-builds.md`.
+`docs/architecture.md`, `docs/remote-builds.md`.
+
+**The next task is ADR-0012 step 3**, listed in `PLAN.md` Phase 1 with its state:
+factor the transaction-semantic layer over a small storage interface, keep the
+in-memory store and RocksDB as two implementations of it, and run the same
+generated operation traces and conflict schedules against both.
+
+Two results from step 2 constrain step 3 and are easy to get wrong, so they are
+repeated here rather than left to whoever needs them:
+
+- **Durability is a parameter, not a property of the store.** Nothing about it
+  holds on the defaults. Upstream gets per-commit durability by **grouping**
+  commits behind one `flush_wal(true)` — it explicitly never fsyncs per
+  transaction, despite a log line that says otherwise (ADR-0013).
+- **Do not inherit RocksDB's transaction path.** It rejects overlapping blind
+  writes, with *and* without `set_snapshot(true)`, which the `surrealds` contract
+  requires to all commit. Take the plain write path and implement commit identity
+  ourselves.
 
 Load the `shared-flyio-build-server` skill before using the build server; it is
 the operational reference and carries the traps.
 
+## The five commands, and what each proves
+
+```bash
+make test        # 19 + 77 conformance (12 ignored) + 6 + 2 + 16 + 3 + 9 + 1, 0 failed
+make golden      # L2: 55 keys / 1526 value bytes, upstream -> us -> upstream
+make interop     # on-disk, both directions, byte for byte
+make durability  # SIGKILL a writer; which durability properties hold, with which knobs
+make smoke       # HTTP round trip against ds+mem:// (needs a local binary; see below)
+```
+
+`make test`, `make golden` and `make interop` all run under `make test --workspace`
+as well; `make interop` and `make durability` exist so the byte and durability
+claims have **names** in the output rather than hiding inside a test count. Read
+each one's limits in `PROGRESS.md` — a green `make interop` says nothing about
+durability, and a green `make durability` measures **recovery, not durability**,
+because `SIGKILL` preserves the page cache.
+
+`make smoke` is the one command with no zero-artifact form: it runs a server, so
+it needs the binary locally via `--copy-back`. It is also the slowest.
+
 ## Build on the shared Fly server, not locally
 
-**The local disk is full.** `target/debug` alone is ~32G against ~18G free, so
-local building is impossible rather than merely slow.
+**The local disk is effectively full** — `/home` has been observed at 100% with
+4.2G free. This repo's own `target/debug` was ~32G and has been deleted; the two
+largest consumers on the box are now `apothic-monorepo` (~16G) and
+`apothic-monorepo-workspace` (~14G), neither of which is ours to clean. So local
+building is not merely slow here, it is unavailable, and it will stay that way
+until someone reclaims space outside this repository.
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
 
-cargo remote-3000 -r fly -d 1.95.0 -- check  --workspace --all-targets
-cargo remote-3000 -r fly -d 1.95.0 -- clippy --workspace --all-targets -- --deny warnings
-cargo remote-3000 -r fly -d 1.95.0 -- test   --workspace
+# Every make target takes a CARGO override, so the documented commands work
+# verbatim once CARGO points at the remote:
+CARGO='cargo remote-3000 -r fly -d 1.95.0 --'
+
+make test CARGO="$CARGO"        # 12 suites, 0 failed
+make golden CARGO="$CARGO"
+make interop CARGO="$CARGO"
+make durability CARGO="$CARGO"
+make clippy CARGO="$CARGO"      # not a target; see below
+make remote CMD='clippy --workspace --all-targets -- --deny warnings'
+
+make remote-stop                 # stop the box so it stops billing
 ```
 
-Nothing comes back unless you pass `--copy-back`, so these return only output.
-For the server binary that `make smoke` needs:
+Nothing comes back unless you pass `--copy-back`, so `test`, `clippy` and `check`
+return only output. For the server binary that `make smoke` needs:
 
 ```bash
 cargo remote-3000 -r fly -d 1.95.0 -- build -c=debug/surrealdb-ds-server -p surrealdb-ds-server
@@ -65,19 +120,21 @@ is the project's most valuable property. An entry claiming more than was checked
 is worse than no entry. Before writing that something works, run the command and
 paste what it printed.
 
-All of these were green at the last commit:
+All of these were green at the last commit, run on the build server:
 
 ```bash
 make check          # clean, zero warnings
-make test           # includes the 77-test upstream conformance suite
+make test           # 19 + 77 conformance (12 ignored) + 6 + 2 + 16 + 3 + 9 + 1, 0 failed
 make golden         # L2 round trip: upstream -> us -> upstream, byte for byte
 make interop        # both directions of on-disk interop with a real upstream store
-make durability     # SIGKILL a writer; which durability properties hold, and with which knobs
-make smoke          # HTTP round trip against ds+mem://
-cargo clippy --workspace --all-targets -- --deny warnings
+make durability     # SIGKILL a writer; which durability properties hold, with which knobs
+make smoke          # HTTP round trip against ds+mem:// (needs a local binary)
+cargo clippy --workspace --all-targets -- --deny warnings   # clean
 ```
 
-`make smoke` is the slow one. A green conformance run does **not** mean full
+`make golden`, `make interop` and `make durability` need a **running** build
+server. `make smoke` is the slow one and is the only command needing a local
+binary. A green conformance run does **not** mean full
 coverage — 12 tests are reported ignored by the suite's own backend-name filters,
 and PROGRESS.md lists exactly which and what we test instead.
 
@@ -85,6 +142,10 @@ and PROGRESS.md lists exactly which and what we test instead.
 
 - **Commit only when asked.** Conventional commits; bodies state what was
   actually verified, including what a green run does *not* cover.
+- **An entry claiming more than was checked is worse than no entry.** When a
+  delegated or self-run result surprises you — including by contradicting a brief
+  you wrote — verify it yourself before recording it. That habit found every
+  substantive error in this project's history so far.
 - **Never commit `target/` or `upstream/`.** Both gitignored.
 - **`crates/surrealdb-ds/src/storage.rs` must never import `surrealdb_kvs`.**
   It is deliberately dependency-free so it survives a move to an independent

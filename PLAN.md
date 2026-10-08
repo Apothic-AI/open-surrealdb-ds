@@ -83,10 +83,33 @@ re-encoding. See ADR-0007 and R-0044/R-0045.
 
 ### Tasks
 
-- [~] Local durable backend (RocksDB as a dependency of ours, not theirs) — the
-      next substantial task. Scope is open: see ADR-0007 for what is and is not
-      yet known about the on-disk format, including that a plain `rocksdb:` path
-      installs **no** timestamp comparator at all (R-0048)
+- [~] **Local durable backend** (RocksDB as a dependency of ours, not theirs) —
+      in progress, decomposed into six steps by **ADR-0012**. Steps 0–2 are done:
+
+      | Step | What | State |
+      | --- | --- | --- |
+      | 0 | Baseline + build server | done |
+      | 1 | Format probe: a directory **we** write, upstream reads | **done** (`make interop`) |
+      | 2 | Restart-safe local persistence | **done** (`make durability`) |
+      | 3 | Differential transaction semantics over a factored storage interface | **next** |
+      | 4 | Durable commit identity, reconciliation, grouped commit | not started |
+      | 5 | Distributed timestamps, quorum, recovery drain | not started |
+      | 6 | Versioned stock-upstream-readable export profile | not started |
+
+      Two results already constrain step 3 and are easy to get wrong. First,
+      **durability is a parameter, not a property of the store**: nothing about it
+      holds on the defaults, and upstream achieves per-commit durability by
+      **grouping**, never by fsyncing per commit (ADR-0013). Second, **RocksDB's
+      transaction path must not be inherited**: it rejects overlapping blind writes,
+      with and without `set_snapshot(true)`, which the `surrealds` contract
+      requires to all commit. Take the plain write path and implement commit
+      identity ourselves.
+
+      Scope note, since it is easy to over-read: on-disk interchangeability is now
+      a **versioned export profile** (step 6), not the architecture. A stock-readable
+      directory is weak evidence — a semantically wrong engine can still write one —
+      so the canonical durability format is independent of it. See ADR-0012's
+      amendment of ADR-0008.
 - [x] Golden-file tests: dataset written by upstream, read by us, and back —
       done 2026-10-04 as `make golden`. 55 keys / 1526 value bytes round-trip
       upstream → `ds+mem://` → upstream byte for byte, with a second upstream
@@ -114,6 +137,12 @@ re-encoding. See ADR-0007 and R-0044/R-0045.
 
 Round-trip a non-trivial dataset — graphs, indexes, vectors, permissions —
 through upstream → us → upstream with byte equality.
+
+**Met 2026-10-04** by `make golden` (55 keys / 1526 value bytes). Phase 1 continues
+past it because the durable backend is a Phase 1 obligation in its own right, and
+because what the exit criterion does *not* cover — durability, recovery, on-disk
+format — is where the remaining risk is. ADR-0007 and ADR-0012 say precisely what is
+and is not evidenced.
 
 ---
 

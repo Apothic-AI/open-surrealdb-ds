@@ -12,14 +12,30 @@ behaviour*. One exception, deliberate and recorded: upstream's backend contract
 suite is vendored under `vendor/` and linked by our test target — see
 [Clean-room discipline](#clean-room-discipline) and ADR-0005.
 
-> **Status: Phase 0 — the seam works, and the engine passes upstream's own
-> conformance suite.** A third-party crate registers as a SurrealDB storage
-> backend, constructs through its own URL scheme alongside upstream's own
-> backends, and passes all 77 runnable tests of SurrealDB's shared backend
-> contract suite. Storage is still in-memory and single-node; nothing here is
-> durable or replicated. See [PROGRESS.md](PROGRESS.md) for exactly what is
-> verified — including what the suite declines to check — and
-> [PLAN.md](PLAN.md) for the roadmap.
+> **Status: Phase 1 — L2 byte compatibility is evidenced, and the durable
+> backend is under construction.**
+>
+> A third-party crate registers as a SurrealDB storage backend, constructs through
+> its own URL scheme alongside upstream's own backends, and passes all 77 runnable
+> tests of SurrealDB's shared backend contract suite.
+>
+> On top of that, three things are now measured rather than assumed:
+>
+> | | Evidence |
+> | --- | --- |
+> | **L2 byte compatibility** | `make golden` — 55 keys / 1526 value bytes round-trip upstream → us → upstream byte for byte |
+> | **On-disk interop, both directions** | `make interop` — our reader opens a directory upstream wrote, and upstream reads one we wrote, byte-identically |
+> | **What durability actually requires** | `make durability` — SIGKILL a writer; atomicity holds on the defaults, durability does not, and upstream gets per-commit durability by *grouping*, never by fsyncing per commit |
+>
+> Storage is **still in-memory and single-node**. Nothing is replicated, there is
+> no consensus, and the durable tier is being built now — ADR-0012 sequences it in
+> six steps, of which three are done.
+>
+> The honest summary is that byte compatibility is *evidenced* and durability is
+> *measured*, while neither is *integrated*: there is no engine that is durable yet.
+> See [PROGRESS.md](PROGRESS.md) for exactly what is verified — including what each
+> of those three deliberately does **not** cover — and [PLAN.md](PLAN.md) for the
+> roadmap.
 
 ---
 
@@ -143,7 +159,9 @@ make check          # type-check every crate
 make test           # run the test suite, including the conformance suite
 make conformance    # run only the upstream KV backend conformance suite
 make golden         # round-trip a dataset through upstream -> us -> upstream, byte for byte
-make interop        # open an upstream-written RocksDB directory with our own reader
+make interop        # both directions of on-disk interop with a real upstream store
+make durability     # SIGKILL a writer; which durability properties hold,
+                    #   and with which configuration
 make construct      # construct the engine from a path and exit, without serving
 make run            # serve SurrealQL on ds+mem:// over HTTP (blocks)
 make smoke          # start the server and exercise it end to end
@@ -151,9 +169,24 @@ make audit-upstream # re-check published SurrealDB crates and licences,
                     #   regenerating docs/upstream-crates.md
 ```
 
-`make bootstrap` is only needed to re-read upstream's interfaces; the build does
-not depend on it, because the one crate we need from the tree is already
-vendored. A fresh clone builds and passes the suite with no network step beyond
+**Every target takes a `CARGO` override**, so on this workstation — where the local
+disk is full and a local build cannot complete — you run the same targets against
+the shared build server:
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+CARGO='cargo remote-3000 -r fly -d 1.95.0 --'
+
+make test CARGO="$CARGO"      # 12 suites, 0 failed
+make remote-stop               # stop the server so it stops billing
+```
+
+`make check` and `make test` are what CI runs, and they call local cargo. See
+[docs/remote-builds.md](docs/remote-builds.md) and the `shared-flyio-build-server`
+skill; `make smoke` additionally needs the server binary locally, which takes an
+explicit `--copy-back`. `make bootstrap` is only needed to re-read upstream's
+interfaces — the build does not depend on it, because the one crate we need from
+the tree is already vendored. A fresh clone builds and passes the suite with no network step beyond
 fetching crates.
 
 ### Continuous integration

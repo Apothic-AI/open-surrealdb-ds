@@ -1,9 +1,10 @@
 # Remote builds
 
 Compilation happens on a shared Fly machine rather than locally, because the
-workstation's disk is at capacity (898G with 18G free, and `target/debug` alone
-is 32G — `deps` 22G, `build` 8.5G, `incremental` 1.7G, plus a 1.8G debug
-`surrealdb-ds-server`).
+workstation's disk is at capacity. This repo's `target/debug` was 32G (`deps` 22G,
+`build` 8.5G, `incremental` 1.7G, plus a 1.8G debug `surrealdb-ds-server`) and has
+been deleted; `/home` has since been observed at 100% with 4.2G free, so local
+building is unavailable regardless.
 
 The operational reference — including how to add another project — is the
 **`shared-flyio-build-server` agent skill**. This file records what is specific
@@ -12,29 +13,39 @@ not change for us.
 
 ## Commands
 
+Every `make` target takes a `CARGO` override, so the documented targets work
+verbatim once it points at the remote:
+
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
 cd /home/bitnom/Code/open-surrealdb-ds
 
-cargo remote-3000 -r fly -d 1.95.0 -- check  --workspace --all-targets
-cargo remote-3000 -r fly -d 1.95.0 -- clippy --workspace --all-targets -- --deny warnings
-cargo remote-3000 -r fly -d 1.95.0 -- test   --workspace
+CARGO='cargo remote-3000 -r fly -d 1.95.0 --'
+
+make check      CARGO="$CARGO"
+make test       CARGO="$CARGO"
+make golden     CARGO="$CARGO"
+make interop    CARGO="$CARGO"
+make durability CARGO="$CARGO"
+make remote CMD='clippy --workspace --all-targets -- --deny warnings'
+make remote-stop
 ```
 
-These return output and nothing else, because cargo-remote copies artifacts back
-only under `--copy-back`. To get the server binary for `make smoke`:
+Two things in that string are not optional: `-d 1.95.0`, because the toolchain
+default is `stable` and every build runs `rustup default`; and the `--`, because
+cargo-remote parses its own flags after the subcommand too and its `-p` is
+`--ssh-port`. See the skill's Traps.
+
+`check`, `test` and `clippy` return output and nothing else, because cargo-remote
+copies artifacts back only under `--copy-back`. To get the server binary for
+`make smoke`:
 
 ```bash
 cargo remote-3000 -r fly -d 1.95.0 -- build -c=debug/surrealdb-ds-server -p surrealdb-ds-server
 ```
 
-`-d 1.95.0` is mandatory, and so is the `--` before the cargo arguments — cargo-remote
-parses its own flags after the subcommand too, and its `-p` is `--ssh-port`. See the
-skill's Traps.
-
-The `Makefile` still calls local `cargo`, so `make check` and friends remain the
-fallback and the local commands of record. `make check` and `make test` are what
-CI runs.
+Without `CARGO`, the targets call local `cargo` — which is what CI runs, and which
+**cannot complete on this workstation** while `/home` is at 100%.
 
 ## The server
 

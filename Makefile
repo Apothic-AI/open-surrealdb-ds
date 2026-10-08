@@ -11,8 +11,26 @@ UPSTREAM_DIR := upstream/surrealdb
 # it, because there the whole point is to see new published versions.
 CARGO_FLAGS ?=
 
+# The cargo to invoke, as a single word. Override it to build on the shared Fly
+# server instead of locally, which is required rather than merely faster on this
+# workstation -- /home has been observed at 100%, so a local build cannot complete.
+#
+#   make test CARGO="cargo remote-3000 -r fly -d 1.95.0 --"
+#
+# The `--` matters: cargo-remote parses its own flags after the cargo subcommand
+# too, and its `-p` is `--ssh-port`, so `... test -p some-crate` dies with
+# `invalid value 'some-crate' for '--ssh-port <PORT>'`. `-d 1.95.0` is equally
+# mandatory: the default is `stable`, and every build runs `rustup default`.
+# See docs/remote-builds.md and the shared-flyio-build-server skill.
+CARGO ?= cargo
+
+# Machine identity for `make remote-stop`, and the default for `make remote`.
+FLY_APP    ?= open-surrealdb-ds-builder
+FLY_MACHINE ?= 87477e0cd01748
+CARGO_REMOTE ?= cargo remote-3000 -r fly -d 1.95.0 --
+
 .DEFAULT_GOAL := help
-.PHONY: help bootstrap check test conformance conformance-list golden golden-update interop durability run construct smoke audit-upstream clean
+.PHONY: help bootstrap check test conformance conformance-list golden golden-update interop durability run construct smoke audit-upstream remote remote-stop clean
 
 help: ## Show this help
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -22,36 +40,42 @@ bootstrap: ## Fetch + pin the upstream reference tree (tag v3.3.0)
 	@./scripts/bootstrap.sh
 
 check: ## Type-check every crate
-	cargo $(CARGO_FLAGS) check --workspace --all-targets
+	$(CARGO) $(CARGO_FLAGS) check --workspace --all-targets
 
 test: ## Run the test suite (includes the upstream conformance suite)
-	cargo $(CARGO_FLAGS) test --workspace
+	$(CARGO) $(CARGO_FLAGS) test --workspace
 
 conformance: ## Run only the upstream KV backend conformance suite
-	cargo $(CARGO_FLAGS) test -p surrealdb-ds --test kvs
+	$(CARGO) $(CARGO_FLAGS) test -p surrealdb-ds --test kvs
 
 conformance-list: ## List every conformance test and whether the suite will run it
-	cargo $(CARGO_FLAGS) test -p surrealdb-ds --test kvs -- --list
+	$(CARGO) $(CARGO_FLAGS) test -p surrealdb-ds --test kvs -- --list
 
 golden: ## Round-trip a non-trivial dataset through upstream -> us -> upstream, byte for byte
-	cargo $(CARGO_FLAGS) test -p surrealdb-ds-server --test golden -- --nocapture
+	$(CARGO) $(CARGO_FLAGS) test -p surrealdb-ds-server --test golden -- --nocapture
 
 golden-update: ## Rewrite the golden manifest from a fresh upstream run (review the diff)
-	DS_GOLDEN_UPDATE=1 cargo $(CARGO_FLAGS) test -p surrealdb-ds-server --test golden -- --nocapture
+	DS_GOLDEN_UPDATE=1 $(CARGO) $(CARGO_FLAGS) test -p surrealdb-ds-server --test golden -- --nocapture
 
 interop: ## Open an upstream-written RocksDB directory with our own reader, byte for byte
-	cargo $(CARGO_FLAGS) test -p surrealdb-ds-server --test interop -- --nocapture
+	$(CARGO) $(CARGO_FLAGS) test -p surrealdb-ds-server --test interop -- --nocapture
 
 durability: ## SIGKILL the store at each commit boundary and measure what survives (ADR-0012 step 2)
-	cargo $(CARGO_FLAGS) test -p surrealdb-ds-server --test durability -- --nocapture
+	$(CARGO) $(CARGO_FLAGS) test -p surrealdb-ds-server --test durability -- --nocapture
 
 construct: ## Construct the engine from a path and exit, without serving
-	cargo $(CARGO_FLAGS) run -q -p surrealdb-ds-server -- construct-only $(or $(PATH_ARG),ds+mem://)
+	$(CARGO) $(CARGO_FLAGS) run -q -p surrealdb-ds-server -- construct-only $(or $(PATH_ARG),ds+mem://)
 
 run: ## Serve SurrealQL on `ds+mem://` over HTTP (blocks; Ctrl-C to stop)
-	cargo $(CARGO_FLAGS) run -q -p surrealdb-ds-server -- start \
+	$(CARGO) $(CARGO_FLAGS) run -q -p surrealdb-ds-server -- start \
 		--bind 127.0.0.1:8000 --username root --password root \
 		$(or $(PATH_ARG),ds+mem://)
+
+remote: ## Run one cargo command on the shared Fly server: make remote CMD='test --workspace'
+	@$(CARGO_REMOTE) $(CMD)
+
+remote-stop: ## Stop the build server so it stops billing
+	@flyctl machine stop $(FLY_MACHINE) -a $(FLY_APP)
 
 smoke: ## Start the server, exercise /health /ready /version and a /rpc round trip
 	@./scripts/smoke-http.sh

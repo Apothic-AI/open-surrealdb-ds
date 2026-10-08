@@ -140,17 +140,29 @@ and a date. Add new records as work proceeds; never edit a citation in place.
 
 ## Gaps
 
-Requirements we know we need but have not yet sourced. Filling these requires
-black-box observation (`OBS`), which has not started.
+Requirements we know we need but have not yet sourced. `OBS` (black-box
+observation) has started — R-0050 through R-0068 are largely observational — so this
+table is now a live list rather than a pre-observation backlog.
 
 | Gap | Why it matters | Planned phase |
 | --- | --- | --- |
-| Exact key encoding for every record class | Required for L2 byte compatibility | 1 |
-| Wire shape of the `Key`/`Val` byte contract for graphs, indexes, vectors, changefeeds | Required for L2 | 1 |
+| Key classes outside the golden/interop workload | No key class is proven complete; an unreachable class fails silently | 1 |
+| On-disk **write** profile for the export target | `make interop` proves a small directory both ways; compaction, blob files, two-level indexes and partitioned filters are configured and unexercised | 1 (ADR-0012 step 6) |
+| Which WAL configuration actually survives **media** loss | `make durability` measures recovery, not durability: `SIGKILL` preserves the page cache, so `sync` is indistinguishable from no sync under a kill | 1 (ADR-0012 step 4) |
+| The asynchronous flush behind `manual_wal_flush` | 576/600 lost, 24/600 survived; the mechanism is unidentified, so we cannot reason about it | 1 (ADR-0012 step 4) |
 | Precise conflict-detection window: what conflicts with what | Silent data corruption if wrong | 2 |
 | `safe_timestamp` semantics under partial commit visibility | Live-query correctness | 2 |
 | Read-your-writes guarantees across nodes after a quorum commit | Stale reads would break SurrealQL semantics | 3 |
 | Behaviour under clock skew | HLC-based timestamps are advertised | 3 |
+
+The first two rows of the previous version of this table — *"exact key encoding for
+every record class"* and *"wire shape of the `Key`/`Val` byte contract"* — were
+**miscounted as gaps and are removed.** The encoding was never unknown: it is declared
+in `surrealdb-datastore`'s `keyspace!` invocation (R-0044), and because `Transactable`
+is byte-level, a backend is handed already-encoded bytes and never decodes them
+(R-0045). What was missing was not knowledge of the encoding but *evidence* that the
+bytes we hold are the bytes a real node holds. `make golden` and `make interop` are
+that evidence, with the scope limits recorded above.
 
 ### Closed by the golden-file harness, and how far
 

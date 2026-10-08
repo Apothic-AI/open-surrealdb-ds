@@ -398,7 +398,8 @@ no public port of any kind. A *separate app* because the pre-existing
 refused both an image change (*"deploying over the remote builder is not
 allowed"*) and a second machine (*"remote builders may have only one volume"*).
 
-Debian is a hard requirement, not a preference — see the ADR-0009 entry below.
+Debian is a hard requirement, not a preference — see ADR-0009 (the failed Alpine
+attempt, whose musl finding is why) and ADR-0010 (the machine that replaced it).
 
 **Multi-project by construction.** `/data/cargo` and `/data/rustup` are shared, so
 the crates.io cache and the toolchain are paid for once; each project gets its own
